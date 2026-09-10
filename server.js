@@ -183,6 +183,59 @@ function isAccepted(value) {
 }
 
 /* =====================================================
+   PROFILE PHOTO HELPERS
+===================================================== */
+
+const PROFILE_PHOTO_BUCKET = "profile-photos";
+const PROFILE_PHOTO_MAX_BYTES =
+  1.5 * 1024 * 1024;
+
+async function getProfileAvatarUrl(
+  avatarPath
+) {
+  if (!avatarPath) {
+    return null;
+  }
+
+  try {
+    const {
+      data,
+      error
+    } =
+      await supabase.storage
+        .from(
+          PROFILE_PHOTO_BUCKET
+        )
+        .createSignedUrl(
+          avatarPath,
+          60 * 60
+        );
+
+    if (error) {
+      console.error(
+        "PROFILE PHOTO SIGNED URL ERROR:",
+        error
+      );
+
+      return null;
+    }
+
+    return (
+      data?.signedUrl ||
+      null
+    );
+  } catch (error) {
+    console.error(
+      "PROFILE PHOTO SIGNED URL EXCEPTION:",
+      error
+    );
+
+    return null;
+  }
+}
+
+
+/* =====================================================
    ACCOUNT NUMBER
 ===================================================== */
 
@@ -5091,7 +5144,357 @@ app.put(
   }
 );
 
+/* =====================================================
+   PROFILE PHOTO UPLOAD
+===================================================== */
 
+app.post(
+  "/api/profile/photo",
+  authenticate,
+  async (req, res) => {
+    try {
+      const {
+        image
+      } =
+        req.body || {};
+
+      if (
+        !image ||
+        typeof image !==
+          "string"
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Profile photo is required"
+        });
+      }
+
+      /* ---------------------------------------------
+         VALIDATE IMAGE DATA
+      --------------------------------------------- */
+
+      const match =
+        image.match(
+          /^data:(image\/jpeg|image\/jpg|image\/png|image\/webp);base64,(.+)$/
+        );
+
+      if (!match) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Invalid profile photo format"
+        });
+      }
+
+      const base64Data =
+        match[2];
+
+      const imageBuffer =
+        Buffer.from(
+          base64Data,
+          "base64"
+        );
+
+      if (
+        !imageBuffer.length
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Profile photo is empty"
+        });
+      }
+
+      if (
+        imageBuffer.length >
+        PROFILE_PHOTO_MAX_BYTES
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Profile photo must be smaller than 1.5MB"
+        });
+      }
+
+      /* ---------------------------------------------
+         GET EXISTING PHOTO
+      --------------------------------------------- */
+
+      const {
+        data: existingProfile,
+        error:
+          existingProfileError
+      } =
+        await supabase
+          .from("profiles")
+          .select(
+            "avatar_path"
+          )
+          .eq(
+            "id",
+            req.user.id
+          )
+          .maybeSingle();
+
+      if (
+        existingProfileError
+      ) {
+        console.error(
+          "PROFILE PHOTO PROFILE LOOKUP ERROR:",
+          existingProfileError
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Unable to load profile"
+        });
+      }
+
+      /* ---------------------------------------------
+         STORAGE PATH
+      --------------------------------------------- */
+
+      const avatarPath =
+        `${req.user.id}/avatar.jpg`;
+
+      /* ---------------------------------------------
+         UPLOAD PHOTO
+      --------------------------------------------- */
+
+      const {
+        error:
+          uploadError
+      } =
+        await supabase.storage
+          .from(
+            PROFILE_PHOTO_BUCKET
+          )
+          .upload(
+            avatarPath,
+            imageBuffer,
+            {
+              contentType:
+                "image/jpeg",
+
+              cacheControl:
+                "3600",
+
+              upsert:
+                true
+            }
+          );
+
+      if (uploadError) {
+        console.error(
+          "PROFILE PHOTO UPLOAD ERROR:",
+          uploadError
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Unable to upload profile photo"
+        });
+      }
+
+      /* ---------------------------------------------
+         SAVE PHOTO PATH TO PROFILE
+      --------------------------------------------- */
+
+      const {
+        error:
+          profileUpdateError
+      } =
+        await supabase
+          .from("profiles")
+          .update({
+            avatar_path:
+              avatarPath,
+
+            avatar_url:
+              null
+          })
+          .eq(
+            "id",
+            req.user.id
+          );
+
+      if (
+        profileUpdateError
+      ) {
+        console.error(
+          "PROFILE PHOTO PROFILE UPDATE ERROR:",
+          profileUpdateError
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Photo uploaded but profile could not be updated"
+        });
+      }
+
+      /* ---------------------------------------------
+         CREATE SIGNED URL
+      --------------------------------------------- */
+
+      const avatarUrl =
+        await getProfileAvatarUrl(
+          avatarPath
+        );
+
+      return res.status(200).json({
+        success: true,
+
+        message:
+          "Profile photo updated successfully",
+
+        avatar_url:
+          avatarUrl,
+
+        avatar_path:
+          avatarPath
+      });
+    } catch (error) {
+      console.error(
+        "PROFILE PHOTO UPLOAD EXCEPTION:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Unable to update profile photo"
+      });
+    }
+  }
+);
+
+/* =====================================================
+   PROFILE PHOTO DELETE
+===================================================== */
+
+app.delete(
+  "/api/profile/photo",
+  authenticate,
+  async (req, res) => {
+    try {
+      const {
+        data: profile,
+        error:
+          profileError
+      } =
+        await supabase
+          .from("profiles")
+          .select(
+            "avatar_path"
+          )
+          .eq(
+            "id",
+            req.user.id
+          )
+          .maybeSingle();
+
+      if (
+        profileError
+      ) {
+        console.error(
+          "PROFILE PHOTO DELETE LOOKUP ERROR:",
+          profileError
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Unable to load profile"
+        });
+      }
+
+      if (
+        profile?.avatar_path
+      ) {
+        const {
+          error:
+            storageError
+        } =
+          await supabase.storage
+            .from(
+              PROFILE_PHOTO_BUCKET
+            )
+            .remove([
+              profile.avatar_path
+            ]);
+
+        if (
+          storageError
+        ) {
+          console.error(
+            "PROFILE PHOTO STORAGE DELETE ERROR:",
+            storageError
+          );
+
+          return res.status(500).json({
+            success: false,
+            message:
+              "Unable to remove profile photo"
+          });
+        }
+      }
+
+      const {
+        error:
+          updateError
+      } =
+        await supabase
+          .from("profiles")
+          .update({
+            avatar_path:
+              null,
+
+            avatar_url:
+              null
+          })
+          .eq(
+            "id",
+            req.user.id
+          );
+
+      if (
+        updateError
+      ) {
+        console.error(
+          "PROFILE PHOTO PROFILE CLEAR ERROR:",
+          updateError
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Unable to clear profile photo"
+        });
+      }
+
+      return res.json({
+        success: true,
+        message:
+          "Profile photo removed successfully"
+      });
+    } catch (error) {
+      console.error(
+        "PROFILE PHOTO DELETE EXCEPTION:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Unable to remove profile photo"
+      });
+    }
+  }
+);
 
 
 /* =====================================================
