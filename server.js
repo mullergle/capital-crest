@@ -2394,6 +2394,19 @@ app.get(
           "ME PROFILE ERROR:",
           profileError
         );
+        
+        /* =====================================================
+   PROFILE PHOTO
+===================================================== */
+
+if (profile?.avatar_path) {
+    profile.avatar_url =
+        await getProfileAvatarUrl(
+            profile.avatar_path
+        );
+} else {
+    profile.avatar_url = null;
+}
 
         return res.status(500).json({
           success: false,
