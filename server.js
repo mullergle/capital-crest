@@ -2923,64 +2923,140 @@ app.post(
         });
       }
 
-      const verifiedAt =
-        new Date().toISOString();
+      const verifiedAt = new Date().toISOString();
 
-      const {
-        error: verificationUpdateError
-      } = await supabase
+      /* 1. Burn the code first so it can never be replayed */
+      const { data: burned, error: burnError } = await supabase
         .from("transfer_verifications")
         .update({ verified_at: verifiedAt })
         .eq("id", verification.id)
-        .eq("user_id", req.user.id);
+        .eq("user_id", req.user.id)
+        .is("verified_at", null)
+        .select("id")
+        .maybeSingle();
 
-      if (verificationUpdateError) {
-        console.error(
-          "TRANSFER VERIFICATION UPDATE ERROR:",
-          verificationUpdateError
-        );
-
-        return res.status(500).json({
+      if (burnError || !burned) {
+        return res.status(400).json({
           success: false,
-          message:
-            "Unable to complete transfer verification"
+          message: "This verification code has already been used"
         });
       }
 
+      /* 2. Re-check funds at the moment of payment */
+      const transferAmount = Number(transfer.amount);
+
+      const { data: bal, error: balError } = await supabase
+        .from("account_balances")
+        .select("*")
+        .eq("account_id", transfer.sender_account_id)
+        .maybeSingle();
+
+      if (balError || !bal) {
+        return res.status(500).json({
+          success: false,
+          message: "Unable to read account balance"
+        });
+      }
+
+      const available = Number(bal.available_balance);
+      const ledger = Number(bal.ledger_balance ?? bal.available_balance);
+
+      if (!Number.isFinite(available) || available < transferAmount) {
+        await supabase
+          .from("transfers")
+          .update({ status: "failed" })
+          .eq("id", transfer_id);
+
+        return res.status(400).json({
+          success: false,
+          message: "Insufficient funds"
+        });
+      }
+
+      /* 3. Debit with an optimistic lock: only succeeds if the balance
+            hasn't changed since we read it (stops double-spend races) */
+      const { data: debited, error: debitError } = await supabase
+        .from("account_balances")
+        .update({
+          available_balance: available - transferAmount,
+          ledger_balance: ledger - transferAmount,
+          updated_at: new Date().toISOString()
+        })
+        .eq("account_id", transfer.sender_account_id)
+        .eq("available_balance", bal.available_balance)
+        .select("account_id")
+        .maybeSingle();
+
+      if (debitError || !debited) {
+        return res.status(409).json({
+          success: false,
+          message: "Your balance changed. Please try the transfer again."
+        });
+      }
+
+      /* 4. Record the transaction so it shows on the dashboard.
+            Column names follow what dashboard.js reads — adjust to match
+            your actual `transactions` table if any differ. */
+      const { error: txError } = await supabase
+        .from("transactions")
+        .insert({
+          user_id: req.user.id,
+          account_id: transfer.sender_account_id,
+          amount: transferAmount,
+          type: "transfer",
+          direction: "out",
+          description: "Transfer " + transfer.reference,
+          reference: transfer.reference,
+          status: "completed"
+        });
+
+      if (txError) {
+        console.error("TRANSACTION INSERT ERROR:", txError);
+        /* Money already moved — don't fail the request, just log it */
+      }
+
+      /* 5. Mark transfer complete */
       const {
         data: updatedTransfer,
         error: transferUpdateError
       } = await supabase
         .from("transfers")
-        .update({ status: "verified" })
+        .update({ status: "completed" })
         .eq("id", transfer_id)
         .eq("sender_user_id", req.user.id)
         .select()
         .single();
 
       if (transferUpdateError) {
-        console.error(
-          "TRANSFER STATUS UPDATE ERROR:",
-          transferUpdateError
-        );
-
-        return res.status(500).json({
-          success: false,
-          message:
-            "Verification succeeded but transfer status could not be updated"
-        });
+        console.error("TRANSFER STATUS UPDATE ERROR:", transferUpdateError);
       }
+
+      /* 6. Notify the customer (non-critical) */
+      try {
+        await supabase.from("notifications").insert({
+          user_id: req.user.id,
+          title: "Transfer completed",
+          message:
+            "Your transfer of $" +
+            transferAmount.toFixed(2) +
+            " (ref " + transfer.reference + ") was completed.",
+          type: "transaction"
+        });
+      } catch (e) {
+        console.error("TRANSFER NOTIFICATION ERROR:", e);
+      }
+
+      const final = updatedTransfer || transfer;
 
       return res.status(200).json({
         success: true,
-        message:
-          "Transfer verification successful",
+        message: "Transfer completed",
         transfer: {
-          id: updatedTransfer.id,
-          reference: updatedTransfer.reference,
-          amount: updatedTransfer.amount,
-          currency: updatedTransfer.currency,
-          status: updatedTransfer.status
+          id: final.id,
+          reference: final.reference,
+          amount: final.amount,
+          currency: final.currency,
+          status: "completed"
         }
       });
     } catch (error) {
