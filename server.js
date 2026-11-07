@@ -68,7 +68,7 @@ app.use(
 app.get("/", (req, res) => {
   res.json({
     success: true,
-    message: "Sterling One Bank API is running"
+    message: "Crest United Bank API is running"
   });
 });
 
@@ -1281,7 +1281,7 @@ app.post(
               user_id: user_id,
               title: "New Support Message",
               message:
-                "You have received a new message from Sterling One Bank Support.",
+                "You have received a new message from Crest United Bank Support.",
               type: "system"
             });
 
@@ -1610,6 +1610,30 @@ app.post(
         });
       }
 
+      /* =================================================
+         DEFAULT BUDGET
+      ================================================= */
+      try {
+        const { error } = await supabase
+          .from("budgets")
+          .insert({
+            user_id: createdUserId,
+            monthly_limit: 5000000.00
+          });
+
+        if (error) {
+          console.error(
+            "DEFAULT BUDGET ERROR:",
+            error
+          );
+        }
+      } catch (error) {
+        console.error(
+          "DEFAULT BUDGET EXCEPTION:",
+          error
+        );
+      }
+
       try {
         const { error } = await supabase
           .from("customer_consents")
@@ -1660,9 +1684,9 @@ app.post(
           .insert({
             user_id: createdUserId,
             title:
-              "Welcome to Sterling One Bank",
+              "Welcome to Crest United Bank",
             message:
-              "Your Sterling One Bank account has been created successfully.",
+              "Your Crest United Bank account has been created successfully.",
             type: "account"
           });
 
@@ -2619,19 +2643,19 @@ app.post(
             error: emailError
           } = await resend.emails.send({
             from:
-              "Sterling One Bank <onboarding@resend.dev>",
+              "Crest United Bank <onboarding@resend.dev>",
             to: customerEmail,
             subject:
-              "Sterling One Bank Transfer Verification",
+              "Crest United Bank Transfer Verification",
             html: `
               <div style="font-family:Arial,sans-serif;line-height:1.6;">
-                <h2>Sterling One Bank</h2>
+                <h2>Crest United Bank</h2>
                 <p>Your transfer verification code is:</p>
                 <div style="font-size:32px;font-weight:bold;letter-spacing:8px;margin:20px 0;">
                   ${verificationCode}
                 </div>
                 <p>This code expires in 10 minutes.</p>
-                <p>If you did not request this transfer, please contact Sterling One Bank Support immediately.</p>
+                <p>If you did not request this transfer, please contact Crest United Bank Support immediately.</p>
               </div>
             `
           });
@@ -2923,140 +2947,64 @@ app.post(
         });
       }
 
-      const verifiedAt = new Date().toISOString();
+      const verifiedAt =
+        new Date().toISOString();
 
-      /* 1. Burn the code first so it can never be replayed */
-      const { data: burned, error: burnError } = await supabase
+      const {
+        error: verificationUpdateError
+      } = await supabase
         .from("transfer_verifications")
         .update({ verified_at: verifiedAt })
         .eq("id", verification.id)
-        .eq("user_id", req.user.id)
-        .is("verified_at", null)
-        .select("id")
-        .maybeSingle();
+        .eq("user_id", req.user.id);
 
-      if (burnError || !burned) {
-        return res.status(400).json({
-          success: false,
-          message: "This verification code has already been used"
-        });
-      }
+      if (verificationUpdateError) {
+        console.error(
+          "TRANSFER VERIFICATION UPDATE ERROR:",
+          verificationUpdateError
+        );
 
-      /* 2. Re-check funds at the moment of payment */
-      const transferAmount = Number(transfer.amount);
-
-      const { data: bal, error: balError } = await supabase
-        .from("account_balances")
-        .select("*")
-        .eq("account_id", transfer.sender_account_id)
-        .maybeSingle();
-
-      if (balError || !bal) {
         return res.status(500).json({
           success: false,
-          message: "Unable to read account balance"
+          message:
+            "Unable to complete transfer verification"
         });
       }
 
-      const available = Number(bal.available_balance);
-      const ledger = Number(bal.ledger_balance ?? bal.available_balance);
-
-      if (!Number.isFinite(available) || available < transferAmount) {
-        await supabase
-          .from("transfers")
-          .update({ status: "failed" })
-          .eq("id", transfer_id);
-
-        return res.status(400).json({
-          success: false,
-          message: "Insufficient funds"
-        });
-      }
-
-      /* 3. Debit with an optimistic lock: only succeeds if the balance
-            hasn't changed since we read it (stops double-spend races) */
-      const { data: debited, error: debitError } = await supabase
-        .from("account_balances")
-        .update({
-          available_balance: available - transferAmount,
-          ledger_balance: ledger - transferAmount,
-          updated_at: new Date().toISOString()
-        })
-        .eq("account_id", transfer.sender_account_id)
-        .eq("available_balance", bal.available_balance)
-        .select("account_id")
-        .maybeSingle();
-
-      if (debitError || !debited) {
-        return res.status(409).json({
-          success: false,
-          message: "Your balance changed. Please try the transfer again."
-        });
-      }
-
-      /* 4. Record the transaction so it shows on the dashboard.
-            Column names follow what dashboard.js reads — adjust to match
-            your actual `transactions` table if any differ. */
-      const { error: txError } = await supabase
-        .from("transactions")
-        .insert({
-          user_id: req.user.id,
-          account_id: transfer.sender_account_id,
-          amount: transferAmount,
-          type: "transfer",
-          direction: "out",
-          description: "Transfer " + transfer.reference,
-          reference: transfer.reference,
-          status: "completed"
-        });
-
-      if (txError) {
-        console.error("TRANSACTION INSERT ERROR:", txError);
-        /* Money already moved — don't fail the request, just log it */
-      }
-
-      /* 5. Mark transfer complete */
       const {
         data: updatedTransfer,
         error: transferUpdateError
       } = await supabase
         .from("transfers")
-        .update({ status: "completed" })
+        .update({ status: "verified" })
         .eq("id", transfer_id)
         .eq("sender_user_id", req.user.id)
         .select()
         .single();
 
       if (transferUpdateError) {
-        console.error("TRANSFER STATUS UPDATE ERROR:", transferUpdateError);
-      }
+        console.error(
+          "TRANSFER STATUS UPDATE ERROR:",
+          transferUpdateError
+        );
 
-      /* 6. Notify the customer (non-critical) */
-      try {
-        await supabase.from("notifications").insert({
-          user_id: req.user.id,
-          title: "Transfer completed",
+        return res.status(500).json({
+          success: false,
           message:
-            "Your transfer of $" +
-            transferAmount.toFixed(2) +
-            " (ref " + transfer.reference + ") was completed.",
-          type: "transaction"
+            "Verification succeeded but transfer status could not be updated"
         });
-      } catch (e) {
-        console.error("TRANSFER NOTIFICATION ERROR:", e);
       }
-
-      const final = updatedTransfer || transfer;
 
       return res.status(200).json({
         success: true,
-        message: "Transfer completed",
+        message:
+          "Transfer verification successful",
         transfer: {
-          id: final.id,
-          reference: final.reference,
-          amount: final.amount,
-          currency: final.currency,
-          status: "completed"
+          id: updatedTransfer.id,
+          reference: updatedTransfer.reference,
+          amount: updatedTransfer.amount,
+          currency: updatedTransfer.currency,
+          status: updatedTransfer.status
         }
       });
     } catch (error) {
@@ -4128,6 +4076,456 @@ app.delete(
 );
 
 /* =====================================================
+   DASHBOARD — MONTHLY SPENDING + BUDGET SUMMARY
+   -----------------------------------------------------
+   Used by dashboard.js so spending & budget come
+   from the server instead of being hardcoded in
+   the frontend.
+===================================================== */
+
+app.get(
+  "/api/dashboard/summary",
+  authenticate,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+
+      const now = new Date();
+
+      const startOfMonth = new Date(
+        Date.UTC(
+          now.getUTCFullYear(),
+          now.getUTCMonth(),
+          1,
+          0, 0, 0, 0
+        )
+      );
+
+      const startOfNextMonth = new Date(
+        Date.UTC(
+          now.getUTCFullYear(),
+          now.getUTCMonth() + 1,
+          1,
+          0, 0, 0, 0
+        )
+      );
+
+      const startOfPrevMonth = new Date(
+        Date.UTC(
+          now.getUTCFullYear(),
+          now.getUTCMonth() - 1,
+          1,
+          0, 0, 0, 0
+        )
+      );
+
+      /* ---------------------------------------------
+         Pull this month's transactions
+      --------------------------------------------- */
+      const {
+        data: currentTransactions,
+        error: currentError
+      } = await supabase
+        .from("transactions")
+        .select(
+          "amount, type, transaction_type, category, direction, created_at"
+        )
+        .eq("user_id", userId)
+        .gte("created_at", startOfMonth.toISOString())
+        .lt(
+          "created_at",
+          startOfNextMonth.toISOString()
+        );
+
+      if (currentError) {
+        console.error(
+          "SUMMARY CURRENT TRANSACTIONS ERROR:",
+          currentError
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Unable to load transactions",
+          error: currentError.message
+        });
+      }
+
+      /* ---------------------------------------------
+         Pull last month's transactions
+      --------------------------------------------- */
+      const {
+        data: prevTransactions,
+        error: prevError
+      } = await supabase
+        .from("transactions")
+        .select(
+          "amount, type, transaction_type, category, direction, created_at"
+        )
+        .eq("user_id", userId)
+        .gte(
+          "created_at",
+          startOfPrevMonth.toISOString()
+        )
+        .lt(
+          "created_at",
+          startOfMonth.toISOString()
+        );
+
+      if (prevError) {
+        console.error(
+          "SUMMARY PREV TRANSACTIONS ERROR:",
+          prevError
+        );
+      }
+
+      /* ---------------------------------------------
+         Compute totals (debits only)
+      --------------------------------------------- */
+      function isDebit(tx) {
+        const direction = String(
+          tx?.direction || ""
+        ).toLowerCase();
+
+        if (
+          direction === "in" ||
+          direction === "incoming" ||
+          direction === "credit"
+        ) {
+          return false;
+        }
+
+        if (
+          direction === "out" ||
+          direction === "outgoing" ||
+          direction === "debit"
+        ) {
+          return true;
+        }
+
+        const type = String(
+          tx?.type ||
+            tx?.transaction_type ||
+            tx?.category ||
+            ""
+        ).toLowerCase();
+
+        if (
+          type.includes("deposit") ||
+          type.includes("credit") ||
+          type.includes("received") ||
+          type.includes("income")
+        ) {
+          return false;
+        }
+
+        if (
+          type.includes("withdraw") ||
+          type.includes("debit") ||
+          type.includes("expense") ||
+          type.includes("payment") ||
+          type.includes("purchase") ||
+          type.includes("transfer")
+        ) {
+          return true;
+        }
+
+        return Number(tx?.amount || 0) < 0;
+      }
+
+      const sumDebits = (list) => {
+        if (!Array.isArray(list)) {
+          return 0;
+        }
+
+        return list.reduce((total, tx) => {
+          if (!isDebit(tx)) {
+            return total;
+          }
+
+          const value = Number(tx.amount || 0);
+
+          if (!Number.isFinite(value)) {
+            return total;
+          }
+
+          return total + Math.abs(value);
+        }, 0);
+      };
+
+      const spendingThisMonth = sumDebits(
+        currentTransactions || []
+      );
+
+      const spendingLastMonth = sumDebits(
+        prevTransactions || []
+      );
+
+      /* ---------------------------------------------
+         Load budget (create default if missing)
+      --------------------------------------------- */
+      let monthlyLimit = 5000000;
+
+      try {
+        const {
+          data: budgetRow,
+          error: budgetError
+        } = await supabase
+          .from("budgets")
+          .select("monthly_limit")
+          .eq("user_id", userId)
+          .maybeSingle();
+
+        if (budgetError) {
+          console.error(
+            "SUMMARY BUDGET LOOKUP ERROR:",
+            budgetError
+          );
+        } else if (budgetRow) {
+          const parsed = Number(
+            budgetRow.monthly_limit
+          );
+
+          if (Number.isFinite(parsed) && parsed > 0) {
+            monthlyLimit = parsed;
+          }
+        } else {
+          /* Auto-create default budget row */
+          const {
+            error: createBudgetError
+          } = await supabase
+            .from("budgets")
+            .insert({
+              user_id: userId,
+              monthly_limit: monthlyLimit
+            });
+
+          if (createBudgetError) {
+            console.error(
+              "SUMMARY DEFAULT BUDGET CREATE ERROR:",
+              createBudgetError
+            );
+          }
+        }
+      } catch (budgetException) {
+        console.error(
+          "SUMMARY BUDGET EXCEPTION:",
+          budgetException
+        );
+      }
+
+      const usedPercent =
+        monthlyLimit > 0
+          ? Math.min(
+              100,
+              Math.max(
+                0,
+                (spendingThisMonth /
+                  monthlyLimit) *
+                  100
+              )
+            )
+          : 0;
+
+      const change =
+        spendingThisMonth - spendingLastMonth;
+
+      let changePercent = 0;
+
+      if (spendingLastMonth > 0) {
+        changePercent =
+          (change / spendingLastMonth) * 100;
+      } else if (spendingThisMonth > 0) {
+        changePercent = 100;
+      }
+
+      return res.json({
+        success: true,
+        period: {
+          month_label: now.toLocaleDateString(
+            "en-US",
+            { month: "long" }
+          ),
+          year: now.getUTCFullYear(),
+          start: startOfMonth.toISOString(),
+          end_exclusive:
+            startOfNextMonth.toISOString()
+        },
+        spending: {
+          this_month: Number(
+            spendingThisMonth.toFixed(2)
+          ),
+          last_month: Number(
+            spendingLastMonth.toFixed(2)
+          ),
+          change: Number(change.toFixed(2)),
+          change_percent: Number(
+            changePercent.toFixed(2)
+          )
+        },
+        budget: {
+          monthly_limit: Number(
+            monthlyLimit.toFixed(2)
+          ),
+          used: Number(
+            spendingThisMonth.toFixed(2)
+          ),
+          used_percent: Number(
+            usedPercent.toFixed(2)
+          ),
+          remaining: Number(
+            Math.max(
+              0,
+              monthlyLimit - spendingThisMonth
+            ).toFixed(2)
+          )
+        }
+      });
+    } catch (error) {
+      console.error(
+        "DASHBOARD SUMMARY ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message:
+          "Unable to load dashboard summary",
+        error: error.message
+      });
+    }
+  }
+);
+
+/* =====================================================
+   DASHBOARD — UPDATE MONTHLY BUDGET
+===================================================== */
+
+app.patch(
+  "/api/dashboard/budget",
+  authenticate,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+
+      const { monthly_limit } = req.body || {};
+
+      const parsed = Number(monthly_limit);
+
+      if (
+        !Number.isFinite(parsed) ||
+        parsed < 0
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "monthly_limit must be a non-negative number"
+        });
+      }
+
+      /* Upsert: create if missing, update if present */
+      const {
+        data: existing,
+        error: lookupError
+      } = await supabase
+        .from("budgets")
+        .select("id")
+        .eq("user_id", userId)
+        .maybeSingle();
+
+      if (lookupError) {
+        console.error(
+          "BUDGET UPDATE LOOKUP ERROR:",
+          lookupError
+        );
+
+        return res.status(500).json({
+          success: false,
+          message:
+            "Unable to load current budget",
+          error: lookupError.message
+        });
+      }
+
+      let savedBudget = null;
+
+      if (existing) {
+        const { data, error } = await supabase
+          .from("budgets")
+          .update({
+            monthly_limit: parsed,
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", existing.id)
+          .eq("user_id", userId)
+          .select()
+          .single();
+
+        if (error) {
+          console.error(
+            "BUDGET UPDATE ERROR:",
+            error
+          );
+
+          return res.status(500).json({
+            success: false,
+            message: "Unable to update budget",
+            error: error.message
+          });
+        }
+
+        savedBudget = data;
+      } else {
+        const { data, error } = await supabase
+          .from("budgets")
+          .insert({
+            user_id: userId,
+            monthly_limit: parsed
+          })
+          .select()
+          .single();
+
+        if (error) {
+          console.error(
+            "BUDGET INSERT ERROR:",
+            error
+          );
+
+          return res.status(500).json({
+            success: false,
+            message: "Unable to create budget",
+            error: error.message
+          });
+        }
+
+        savedBudget = data;
+      }
+
+      return res.json({
+        success: true,
+        message: "Budget updated successfully",
+        budget: {
+          monthly_limit: Number(
+            savedBudget.monthly_limit
+          )
+        }
+      });
+    } catch (error) {
+      console.error(
+        "BUDGET UPDATE EXCEPTION:",
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message: "Unable to update budget",
+        error: error.message
+      });
+    }
+  }
+);
+
+/* =====================================================
    404 HANDLER
 ===================================================== */
 
@@ -4166,6 +4564,6 @@ app.use((error, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(
-    `Capital Crest Bank API running on port ${PORT}`
+    `Crest United Bank API running on port ${PORT}`
   );
 });
