@@ -2406,7 +2406,7 @@ app.delete(
 );
 
 /* =====================================================
-   TRANSFERS
+   TRANSFERS (EXTERNAL BANK SUPPORT)
 ===================================================== */
 
 app.post(
@@ -2415,66 +2415,39 @@ app.post(
   async (req, res) => {
     try {
       const {
+        recipient_bank_name,
+        recipient_swift_code,
+        recipient_routing_number,
         recipient_account_number,
-        recipient_name,
-        recipient_bank,
         amount,
         description
       } = req.body || {};
 
       if (
-        !recipient_account_number ||
-        amount === undefined ||
+        !recipient_bank_name || 
+        !recipient_swift_code || 
+        !recipient_routing_number || 
+        !recipient_account_number || 
+        amount === undefined || 
         amount === null
       ) {
         return res.status(400).json({
           success: false,
-          message:
-            "Recipient account and amount are required"
+          message: "All recipient banking details and amount are required"
         });
       }
 
-      const recipientAccountNumber =
-        String(recipient_account_number).trim();
-
       const transferAmount = Number(amount);
 
-      if (
-        !Number.isFinite(transferAmount) ||
-        transferAmount <= 0
-      ) {
+      if (!Number.isFinite(transferAmount) || transferAmount <= 0) {
         return res.status(400).json({
           success: false,
           message: "Invalid transfer amount"
         });
       }
 
-      const recipients = {
-        "8115737838": {
-          name: "Raphael Ovadje",
-          bank: "Bank of America"
-        },
-        "123456789": {
-          name: "Olueay Shay",
-          bank: "Bank of America"
-        }
-      };
-
-      const recipient =
-        recipients[recipientAccountNumber];
-
-      if (!recipient) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Recipient account is not supported"
-        });
-      }
-
-      const {
-        data: account,
-        error: accountError
-      } = await supabase
+      /* 1. Find Sender Account */
+      const { data: account, error: accountError } = await supabase
         .from("accounts")
         .select("*")
         .eq("user_id", req.user.id)
@@ -2483,121 +2456,75 @@ app.post(
         .limit(1)
         .maybeSingle();
 
-      if (accountError) {
-        console.error(
-          "SENDER ACCOUNT ERROR:",
-          accountError
-        );
-
-        return res.status(500).json({
-          success: false,
-          message: accountError.message
-        });
-      }
-
-      if (!account) {
+      if (accountError || !account) {
         return res.status(404).json({
           success: false,
-          message:
-            "Active checking account not found"
+          message: "Active checking account not found"
         });
       }
 
-      const {
-        data: balance,
-        error: balanceError
-      } = await supabase
+      if (account.status === "suspended") {
+        return res.status(403).json({
+          success: false,
+          message: "Your account is currently suspended."
+        });
+      }
+
+      /* 2. Check Sender Balance */
+      const { data: balance, error: balanceError } = await supabase
         .from("account_balances")
         .select("*")
         .eq("account_id", account.id)
         .maybeSingle();
 
-      if (balanceError) {
-        console.error(
-          "BALANCE LOOKUP ERROR:",
-          balanceError
-        );
-
-        return res.status(500).json({
-          success: false,
-          message: balanceError.message
-        });
-      }
-
-      if (!balance) {
+      if (balanceError || !balance) {
         return res.status(404).json({
           success: false,
           message: "Account balance not found"
         });
       }
 
-      const availableBalance = Number(
-        balance.available_balance
-      );
-
-      if (!Number.isFinite(availableBalance)) {
-        return res.status(500).json({
-          success: false,
-          message: "Invalid account balance"
-        });
-      }
-
-      if (availableBalance < transferAmount) {
+      if (Number(balance.available_balance) < transferAmount) {
         return res.status(400).json({
           success: false,
           message: "Insufficient funds"
         });
       }
 
-      const reference =
-        generateReference("TRF");
+      /* 3. Create Pending Transfer with External Bank Details */
+      const reference = generateReference("TRF");
 
-      const {
-        data: transfer,
-        error: transferError
-      } = await supabase
+      const { data: transfer, error: transferError } = await supabase
         .from("transfers")
         .insert({
           sender_user_id: req.user.id,
           sender_account_id: account.id,
-          beneficiary_id: null,
           amount: transferAmount,
-          currency: account.currency,
+          currency: account.currency || "USD",
           reference,
-          status: "pending"
+          status: "pending",
+          recipient_bank_name: String(recipient_bank_name).trim(),
+          recipient_swift_code: String(recipient_swift_code).trim().toUpperCase(),
+          recipient_routing_number: String(recipient_routing_number).trim(),
+          recipient_account_number: String(recipient_account_number).trim()
         })
         .select()
         .single();
 
       if (transferError) {
-        console.error(
-          "TRANSFER CREATE ERROR:",
-          transferError
-        );
-
+        console.error("TRANSFER CREATE ERROR:", transferError);
         return res.status(400).json({
           success: false,
-          message: transferError.message
+          message: "Unable to initiate transfer"
         });
       }
 
-      const verificationCode = crypto
-        .randomInt(100000, 1000000)
-        .toString();
+      /* 4. Generate OTP */
+      const verificationCode = crypto.randomInt(100000, 1000000).toString();
+      const codeHash = crypto.createHash("sha256").update(verificationCode).digest("hex");
+      const expiresAt = new Date(Date.now() + CODE_EXPIRY).toISOString();
 
-      const codeHash = crypto
-        .createHash("sha256")
-        .update(verificationCode)
-        .digest("hex");
-
-      const expiresAt = new Date(
-        Date.now() + CODE_EXPIRY
-      ).toISOString();
-
-      const {
-        data: verification,
-        error: verificationError
-      } = await supabase
+      const { error: verificationError } = await supabase
         .from("transfer_verifications")
         .insert({
           user_id: req.user.id,
@@ -2605,48 +2532,24 @@ app.post(
           code_hash: codeHash,
           expires_at: expiresAt,
           attempts: 0
-        })
-        .select()
-        .single();
+        });
 
       if (verificationError) {
-        console.error(
-          "TRANSFER VERIFICATION CREATE ERROR:",
-          verificationError
-        );
-
-        await supabase
-          .from("transfers")
-          .delete()
-          .eq("id", transfer.id)
-          .eq("sender_user_id", req.user.id);
-
+        await supabase.from("transfers").delete().eq("id", transfer.id);
         return res.status(500).json({
           success: false,
-          message:
-            "Unable to create transfer verification"
+          message: "Unable to create transfer verification"
         });
       }
 
+      /* 5. Send OTP Email */
       if (SEND_TRANSFER_OTP_EMAIL) {
         try {
           const customerEmail = req.user.email;
-
-          if (!customerEmail) {
-            throw new Error(
-              "Customer email not found"
-            );
-          }
-
-          const {
-            data: emailData,
-            error: emailError
-          } = await resend.emails.send({
-            from:
-              "Crest United Bank <onboarding@resend.dev>",
+          await resend.emails.send({
+            from: "Crest United Bank <onboarding@resend.dev>",
             to: customerEmail,
-            subject:
-              "Crest United Bank Transfer Verification",
+            subject: "Crest United Bank Transfer Verification",
             html: `
               <div style="font-family:Arial,sans-serif;line-height:1.6;">
                 <h2>Crest United Bank</h2>
@@ -2659,30 +2562,14 @@ app.post(
               </div>
             `
           });
-
-          console.log(
-            "RESEND EMAIL RESPONSE:",
-            { data: emailData, error: emailError }
-          );
-
-          if (emailError) {
-            throw new Error(
-              emailError.message ||
-                "Resend failed to send email"
-            );
-          }
         } catch (emailError) {
-          console.error(
-            "TRANSFER OTP EMAIL ERROR:",
-            emailError
-          );
+          console.error("TRANSFER OTP EMAIL ERROR:", emailError);
         }
       }
 
       return res.status(201).json({
         success: true,
-        message:
-          "Transfer verification required",
+        message: "Transfer verification required",
         transfer: {
           id: transfer.id,
           reference: transfer.reference,
@@ -2690,10 +2577,8 @@ app.post(
           currency: transfer.currency,
           status: transfer.status,
           recipient: {
-            account_number:
-              recipientAccountNumber,
-            name: recipient.name,
-            bank: recipient.bank
+            bank_name: transfer.recipient_bank_name,
+            account_number: transfer.recipient_account_number
           }
         },
         verification: {
@@ -2702,15 +2587,111 @@ app.post(
         }
       });
     } catch (error) {
-      console.error(
-        "TRANSFER CREATE EXCEPTION:",
-        error
-      );
-
+      console.error("TRANSFER CREATE EXCEPTION:", error);
       return res.status(500).json({
         success: false,
-        message: "Unable to create transfer"
+        message: "Unable to process transfer"
       });
+    }
+  }
+);
+
+/* =====================================================
+   VERIFY TRANSFER & MOVE MONEY
+===================================================== */
+
+app.post(
+  "/api/transfers/verify",
+  authenticate,
+  async (req, res) => {
+    try {
+      const { transfer_id, code } = req.body || {};
+
+      if (!transfer_id || !code) {
+        return res.status(400).json({ success: false, message: "Transfer ID and code required" });
+      }
+
+      const verificationCode = String(code).trim();
+
+      const { data: transfer, error: transferError } = await supabase
+        .from("transfers")
+        .select("*")
+        .eq("id", transfer_id)
+        .eq("sender_user_id", req.user.id)
+        .maybeSingle();
+
+      if (transferError || !transfer) {
+        return res.status(404).json({ success: false, message: "Transfer not found" });
+      }
+
+      if (transfer.status !== "pending") {
+        return res.status(400).json({ success: false, message: "Transfer already processed" });
+      }
+
+      const { data: verification } = await supabase
+        .from("transfer_verifications")
+        .select("*")
+        .eq("transfer_id", transfer_id)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (!verification || verification.verified_at) {
+        return res.status(400).json({ success: false, message: "Invalid or used verification" });
+      }
+
+      if (Date.now() > new Date(verification.expires_at).getTime()) {
+        return res.status(400).json({ success: false, message: "Code expired" });
+      }
+
+      const submittedHash = crypto.createHash("sha256").update(verificationCode).digest("hex");
+      if (submittedHash !== verification.code_hash) {
+        await supabase.from("transfer_verifications").update({ attempts: verification.attempts + 1 }).eq("id", verification.id);
+        return res.status(400).json({ success: false, message: "Incorrect verification code" });
+      }
+
+      /* =================================================
+         OTP CORRECT - MOVE MONEY NOW
+      ================================================= */
+      const now = new Date().toISOString();
+
+      // 1. Deduct Sender Balance
+      const { data: senderAcc } = await supabase.from("accounts").select("id").eq("user_id", req.user.id).eq("account_type", "checking").single();
+      const { data: senderBal } = await supabase.from("account_balances").select("available_balance").eq("account_id", senderAcc.id).single();
+
+      await supabase.from("account_balances")
+        .update({ available_balance: Number(senderBal.available_balance) - Number(transfer.amount), updated_at: now })
+        .eq("account_id", senderAcc.id);
+
+      // 2. Log Sender Transaction
+      await supabase.from("transactions").insert({
+        user_id: req.user.id,
+        account_id: senderAcc.id,
+        amount: transfer.amount,
+        type: "Transfer Out",
+        direction: "out",
+        description: `External transfer to ${transfer.recipient_bank_name} (${transfer.recipient_account_number})`,
+        status: "completed"
+      });
+
+      // 3. Mark Complete
+      await supabase.from("transfer_verifications").update({ verified_at: now }).eq("id", verification.id);
+      const { data: updatedTransfer } = await supabase.from("transfers").update({ status: "completed" }).eq("id", transfer_id).select().single();
+
+      return res.status(200).json({
+        success: true,
+        message: "Transfer successful",
+        transfer: {
+          id: updatedTransfer.id,
+          reference: updatedTransfer.reference,
+          amount: updatedTransfer.amount,
+          currency: updatedTransfer.currency,
+          status: updatedTransfer.status
+        }
+      });
+    } catch (error) {
+      console.error("VERIFY ERROR:", error);
+      return res.status(500).json({ success: false, message: "Unable to verify transfer" });
     }
   }
 );
