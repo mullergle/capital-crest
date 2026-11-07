@@ -184,18 +184,11 @@ function isAccepted(value) {
 
 /* =====================================================
    PROFILE PHOTO HELPERS
-   -----------------------------------------------------
-   Uses a PUBLIC bucket URL (permanent).
-   No signed URL, no expiry — survives refresh & re-login.
 ===================================================== */
 
 const PROFILE_PHOTO_BUCKET = "profile-photos";
 const PROFILE_PHOTO_MAX_BYTES = 1.5 * 1024 * 1024;
 
-/* -----------------------------------------------------
-   Returns a permanent public URL for the avatar.
-   Synchronous — no await needed.
------------------------------------------------------ */
 function getProfileAvatarUrl(avatarPath) {
   if (!avatarPath) {
     return null;
@@ -1618,7 +1611,7 @@ app.post(
           .from("budgets")
           .insert({
             user_id: createdUserId,
-            monthly_limit: 5000000.00
+            monthly_limit: 5000.00
           });
 
         if (error) {
@@ -1908,10 +1901,6 @@ app.get(
 
       /* =====================================================
          PROFILE PHOTO
-         -----------------------------------------------------
-         Attach a permanent public URL so the frontend
-         always receives the image, on every refresh
-         and every login.
       ===================================================== */
       profile.avatar_url =
         getProfileAvatarUrl(
@@ -2406,7 +2395,7 @@ app.delete(
 );
 
 /* =====================================================
-   TRANSFERS (EXTERNAL BANK SUPPORT)
+   TRANSFERS (UPDATED WITH ACCOUNT NAME)
 ===================================================== */
 
 app.post(
@@ -2415,6 +2404,7 @@ app.post(
   async (req, res) => {
     try {
       const {
+        recipient_name,
         recipient_bank_name,
         recipient_swift_code,
         recipient_routing_number,
@@ -2424,6 +2414,7 @@ app.post(
       } = req.body || {};
 
       if (
+        !recipient_name ||
         !recipient_bank_name || 
         !recipient_swift_code || 
         !recipient_routing_number || 
@@ -2446,7 +2437,6 @@ app.post(
         });
       }
 
-      /* 1. Find Sender Account */
       const { data: account, error: accountError } = await supabase
         .from("accounts")
         .select("*")
@@ -2470,7 +2460,6 @@ app.post(
         });
       }
 
-      /* 2. Check Sender Balance */
       const { data: balance, error: balanceError } = await supabase
         .from("account_balances")
         .select("*")
@@ -2491,7 +2480,6 @@ app.post(
         });
       }
 
-      /* 3. Create Pending Transfer with External Bank Details */
       const reference = generateReference("TRF");
 
       const { data: transfer, error: transferError } = await supabase
@@ -2503,6 +2491,7 @@ app.post(
           currency: account.currency || "USD",
           reference,
           status: "pending",
+          recipient_name: String(recipient_name).trim(),
           recipient_bank_name: String(recipient_bank_name).trim(),
           recipient_swift_code: String(recipient_swift_code).trim().toUpperCase(),
           recipient_routing_number: String(recipient_routing_number).trim(),
@@ -2519,7 +2508,6 @@ app.post(
         });
       }
 
-      /* 4. Generate OTP */
       const verificationCode = crypto.randomInt(100000, 1000000).toString();
       const codeHash = crypto.createHash("sha256").update(verificationCode).digest("hex");
       const expiresAt = new Date(Date.now() + CODE_EXPIRY).toISOString();
@@ -2542,7 +2530,6 @@ app.post(
         });
       }
 
-      /* 5. Send OTP Email */
       if (SEND_TRANSFER_OTP_EMAIL) {
         try {
           const customerEmail = req.user.email;
@@ -2577,6 +2564,7 @@ app.post(
           currency: transfer.currency,
           status: transfer.status,
           recipient: {
+            name: transfer.recipient_name,
             bank_name: transfer.recipient_bank_name,
             account_number: transfer.recipient_account_number
           }
@@ -2597,7 +2585,7 @@ app.post(
 );
 
 /* =====================================================
-   VERIFY TRANSFER & MOVE MONEY
+   VERIFY TRANSFER
 ===================================================== */
 
 app.post(
@@ -2608,10 +2596,13 @@ app.post(
       const { transfer_id, code } = req.body || {};
 
       if (!transfer_id || !code) {
-        return res.status(400).json({ success: false, message: "Transfer ID and code required" });
+        return res.status(400).json({ success: false, message: "Transfer ID and verification code are required" });
       }
 
       const verificationCode = String(code).trim();
+      if (!/^\d{6}$/.test(verificationCode)) {
+        return res.status(400).json({ success: false, message: "Verification code must be 6 digits" });
+      }
 
       const { data: transfer, error: transferError } = await supabase
         .from("transfers")
@@ -2625,62 +2616,76 @@ app.post(
       }
 
       if (transfer.status !== "pending") {
-        return res.status(400).json({ success: false, message: "Transfer already processed" });
+        return res.status(400).json({ success: false, message: "This transfer is no longer awaiting verification" });
       }
 
-      const { data: verification } = await supabase
+      const { data: verification, error: verificationError } = await supabase
         .from("transfer_verifications")
         .select("*")
         .eq("transfer_id", transfer_id)
+        .eq("user_id", req.user.id)
         .order("created_at", { ascending: false })
         .limit(1)
         .maybeSingle();
 
-      if (!verification || verification.verified_at) {
-        return res.status(400).json({ success: false, message: "Invalid or used verification" });
+      if (verificationError || !verification) {
+        return res.status(404).json({ success: false, message: "Transfer verification not found" });
       }
 
-      if (Date.now() > new Date(verification.expires_at).getTime()) {
-        return res.status(400).json({ success: false, message: "Code expired" });
+      if (verification.verified_at) {
+        return res.status(400).json({ success: false, message: "This verification code has already been used" });
+      }
+
+      const MAX_ATTEMPTS = 5;
+      if (Number(verification.attempts) >= MAX_ATTEMPTS) {
+        return res.status(429).json({ success: false, message: "Too many incorrect attempts. Please request a new verification code." });
+      }
+
+      const expiresAt = new Date(verification.expires_at).getTime();
+      if (!Number.isFinite(expiresAt) || Date.now() > expiresAt) {
+        return res.status(400).json({ success: false, message: "Verification code has expired" });
       }
 
       const submittedHash = crypto.createHash("sha256").update(verificationCode).digest("hex");
-      if (submittedHash !== verification.code_hash) {
-        await supabase.from("transfer_verifications").update({ attempts: verification.attempts + 1 }).eq("id", verification.id);
+      const codeMatches = crypto.timingSafeEqual(Buffer.from(submittedHash, "utf8"), Buffer.from(verification.code_hash, "utf8"));
+
+      if (!codeMatches) {
+        const newAttempts = Number(verification.attempts) + 1;
+        await supabase.from("transfer_verifications").update({ attempts: newAttempts }).eq("id", verification.id);
         return res.status(400).json({ success: false, message: "Incorrect verification code" });
       }
 
       /* =================================================
-         OTP CORRECT - MOVE MONEY NOW
+         OTP IS CORRECT - MOVE THE MONEY NOW
       ================================================= */
       const now = new Date().toISOString();
 
-      // 1. Deduct Sender Balance
-      const { data: senderAcc } = await supabase.from("accounts").select("id").eq("user_id", req.user.id).eq("account_type", "checking").single();
-      const { data: senderBal } = await supabase.from("account_balances").select("available_balance").eq("account_id", senderAcc.id).single();
-
+      // Deduct from sender
+      const { data: senderAcc } = await supabase.from("accounts").select("id").eq("user_id", req.user.id).eq("account_type", "checking").maybeSingle();
+      const { data: senderBal } = await supabase.from("account_balances").select("available_balance").eq("account_id", senderAcc.id).maybeSingle();
+      
       await supabase.from("account_balances")
         .update({ available_balance: Number(senderBal.available_balance) - Number(transfer.amount), updated_at: now })
         .eq("account_id", senderAcc.id);
 
-      // 2. Log Sender Transaction
+      // Log Sender Transaction
       await supabase.from("transactions").insert({
-        user_id: req.user.id,
-        account_id: senderAcc.id,
-        amount: transfer.amount,
-        type: "Transfer Out",
-        direction: "out",
-        description: `External transfer to ${transfer.recipient_bank_name} (${transfer.recipient_account_number})`,
-        status: "completed"
+          user_id: req.user.id,
+          account_id: senderAcc.id,
+          amount: transfer.amount,
+          type: "Transfer Out",
+          direction: "out",
+          description: `External transfer to ${transfer.recipient_bank_name} (${transfer.recipient_account_number})`,
+          status: "completed"
       });
 
-      // 3. Mark Complete
+      // Mark verification & transfer as complete
       await supabase.from("transfer_verifications").update({ verified_at: now }).eq("id", verification.id);
       const { data: updatedTransfer } = await supabase.from("transfers").update({ status: "completed" }).eq("id", transfer_id).select().single();
 
       return res.status(200).json({
         success: true,
-        message: "Transfer successful",
+        message: "Transfer verification successful",
         transfer: {
           id: updatedTransfer.id,
           reference: updatedTransfer.reference,
@@ -2690,314 +2695,8 @@ app.post(
         }
       });
     } catch (error) {
-      console.error("VERIFY ERROR:", error);
+      console.error("TRANSFER VERIFICATION ERROR:", error);
       return res.status(500).json({ success: false, message: "Unable to verify transfer" });
-    }
-  }
-);
-
-/* =====================================================
-   VERIFY TRANSFER
-===================================================== */
-
-app.post(
-  "/api/transfers/verify",
-  authenticate,
-  async (req, res) => {
-    try {
-      const { transfer_id, code } =
-        req.body || {};
-
-      if (!transfer_id || !code) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Transfer ID and verification code are required"
-        });
-      }
-
-      const verificationCode =
-        String(code).trim();
-
-      if (!/^\d{6}$/.test(verificationCode)) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Verification code must be 6 digits"
-        });
-      }
-
-      const {
-        data: transfer,
-        error: transferError
-      } = await supabase
-        .from("transfers")
-        .select("*")
-        .eq("id", transfer_id)
-        .eq("sender_user_id", req.user.id)
-        .maybeSingle();
-
-      if (transferError) {
-        console.error(
-          "TRANSFER LOOKUP ERROR:",
-          transferError
-        );
-
-        return res.status(500).json({
-          success: false,
-          message: transferError.message
-        });
-      }
-
-      if (!transfer) {
-        return res.status(404).json({
-          success: false,
-          message: "Transfer not found"
-        });
-      }
-
-      if (transfer.status !== "pending") {
-        return res.status(400).json({
-          success: false,
-          message:
-            "This transfer is no longer awaiting verification"
-        });
-      }
-
-      const {
-        data: verification,
-        error: verificationError
-      } = await supabase
-        .from("transfer_verifications")
-        .select("*")
-        .eq("transfer_id", transfer_id)
-        .eq("user_id", req.user.id)
-        .order("created_at", {
-          ascending: false
-        })
-        .limit(1)
-        .maybeSingle();
-
-      if (verificationError) {
-        console.error(
-          "TRANSFER VERIFICATION LOOKUP ERROR:",
-          verificationError
-        );
-
-        return res.status(500).json({
-          success: false,
-          message: verificationError.message
-        });
-      }
-
-      if (!verification) {
-        return res.status(404).json({
-          success: false,
-          message:
-            "Transfer verification not found"
-        });
-      }
-
-      if (verification.verified_at) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "This verification code has already been used"
-        });
-      }
-
-      const MAX_ATTEMPTS = 5;
-
-      if (
-        Number(verification.attempts) >=
-        MAX_ATTEMPTS
-      ) {
-        return res.status(429).json({
-          success: false,
-          message:
-            "Too many incorrect attempts. Please request a new verification code."
-        });
-      }
-
-      const expiresAt = new Date(
-        verification.expires_at
-      ).getTime();
-
-      if (
-        !Number.isFinite(expiresAt) ||
-        Date.now() > expiresAt
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "Verification code has expired"
-        });
-      }
-
-      const submittedHash = crypto
-        .createHash("sha256")
-        .update(verificationCode)
-        .digest("hex");
-
-      const submittedBuffer = Buffer.from(
-        submittedHash,
-        "utf8"
-      );
-
-      const storedBuffer = Buffer.from(
-        verification.code_hash,
-        "utf8"
-      );
-
-      const codeMatches =
-        submittedBuffer.length ===
-          storedBuffer.length &&
-        crypto.timingSafeEqual(
-          submittedBuffer,
-          storedBuffer
-        );
-
-      if (!codeMatches) {
-        const newAttempts =
-          Number(verification.attempts) + 1;
-
-        await supabase
-          .from("transfer_verifications")
-          .update({ attempts: newAttempts })
-          .eq("id", verification.id)
-          .eq("user_id", req.user.id);
-
-        const remainingAttempts = Math.max(
-          0,
-          MAX_ATTEMPTS - newAttempts
-        );
-
-        if (remainingAttempts === 0) {
-          return res.status(429).json({
-            success: false,
-            message:
-              "Too many incorrect attempts. Please request a new verification code."
-          });
-        }
-
-        return res.status(400).json({
-          success: false,
-          message: "Incorrect verification code",
-          remaining_attempts: remainingAttempts
-        });
-      }
-
-      const {
-        data: senderAccount,
-        error: senderAccountError
-      } = await supabase
-        .from("accounts")
-        .select("id, status")
-        .eq("user_id", req.user.id)
-        .eq("account_type", "checking")
-        .in("status", ["active", "suspended"])
-        .limit(1)
-        .maybeSingle();
-
-      if (senderAccountError) {
-        console.error(
-          "SENDER ACCOUNT STATUS ERROR:",
-          senderAccountError
-        );
-
-        return res.status(500).json({
-          success: false,
-          message:
-            "Unable to verify account status"
-        });
-      }
-
-      if (!senderAccount) {
-        return res.status(404).json({
-          success: false,
-          message: "Checking account not found"
-        });
-      }
-
-      if (senderAccount.status === "suspended") {
-        return res.status(403).json({
-          success: false,
-          code: "ACCOUNT_SUSPENDED",
-          message:
-            "Transfer failed. Please contact Support."
-        });
-      }
-
-      const verifiedAt =
-        new Date().toISOString();
-
-      const {
-        error: verificationUpdateError
-      } = await supabase
-        .from("transfer_verifications")
-        .update({ verified_at: verifiedAt })
-        .eq("id", verification.id)
-        .eq("user_id", req.user.id);
-
-      if (verificationUpdateError) {
-        console.error(
-          "TRANSFER VERIFICATION UPDATE ERROR:",
-          verificationUpdateError
-        );
-
-        return res.status(500).json({
-          success: false,
-          message:
-            "Unable to complete transfer verification"
-        });
-      }
-
-      const {
-        data: updatedTransfer,
-        error: transferUpdateError
-      } = await supabase
-        .from("transfers")
-        .update({ status: "verified" })
-        .eq("id", transfer_id)
-        .eq("sender_user_id", req.user.id)
-        .select()
-        .single();
-
-      if (transferUpdateError) {
-        console.error(
-          "TRANSFER STATUS UPDATE ERROR:",
-          transferUpdateError
-        );
-
-        return res.status(500).json({
-          success: false,
-          message:
-            "Verification succeeded but transfer status could not be updated"
-        });
-      }
-
-      return res.status(200).json({
-        success: true,
-        message:
-          "Transfer verification successful",
-        transfer: {
-          id: updatedTransfer.id,
-          reference: updatedTransfer.reference,
-          amount: updatedTransfer.amount,
-          currency: updatedTransfer.currency,
-          status: updatedTransfer.status
-        }
-      });
-    } catch (error) {
-      console.error(
-        "TRANSFER VERIFICATION ERROR:",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message: "Unable to verify transfer"
-      });
     }
   }
 );
@@ -3914,11 +3613,9 @@ app.post(
         });
       }
 
-      /* Compute permanent public URL */
       const avatarUrl =
         getProfileAvatarUrl(avatarPath);
 
-      /* Save both the path AND the public URL */
       const {
         error: profileUpdateError
       } = await supabase
@@ -4058,10 +3755,6 @@ app.delete(
 
 /* =====================================================
    DASHBOARD — MONTHLY SPENDING + BUDGET SUMMARY
-   -----------------------------------------------------
-   Used by dashboard.js so spending & budget come
-   from the server instead of being hardcoded in
-   the frontend.
 ===================================================== */
 
 app.get(
@@ -4070,310 +3763,87 @@ app.get(
   async (req, res) => {
     try {
       const userId = req.user.id;
-
       const now = new Date();
+      const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
+      const startOfNextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0, 0));
+      const startOfPrevMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1, 0, 0, 0, 0));
 
-      const startOfMonth = new Date(
-        Date.UTC(
-          now.getUTCFullYear(),
-          now.getUTCMonth(),
-          1,
-          0, 0, 0, 0
-        )
-      );
-
-      const startOfNextMonth = new Date(
-        Date.UTC(
-          now.getUTCFullYear(),
-          now.getUTCMonth() + 1,
-          1,
-          0, 0, 0, 0
-        )
-      );
-
-      const startOfPrevMonth = new Date(
-        Date.UTC(
-          now.getUTCFullYear(),
-          now.getUTCMonth() - 1,
-          1,
-          0, 0, 0, 0
-        )
-      );
-
-      /* ---------------------------------------------
-         Pull this month's transactions
-      --------------------------------------------- */
-      const {
-        data: currentTransactions,
-        error: currentError
-      } = await supabase
+      const { data: currentTransactions } = await supabase
         .from("transactions")
-        .select(
-          "amount, type, transaction_type, category, direction, created_at"
-        )
+        .select("amount, type, transaction_type, category, direction, created_at")
         .eq("user_id", userId)
         .gte("created_at", startOfMonth.toISOString())
-        .lt(
-          "created_at",
-          startOfNextMonth.toISOString()
-        );
+        .lt("created_at", startOfNextMonth.toISOString());
 
-      if (currentError) {
-        console.error(
-          "SUMMARY CURRENT TRANSACTIONS ERROR:",
-          currentError
-        );
-
-        return res.status(500).json({
-          success: false,
-          message:
-            "Unable to load transactions",
-          error: currentError.message
-        });
-      }
-
-      /* ---------------------------------------------
-         Pull last month's transactions
-      --------------------------------------------- */
-      const {
-        data: prevTransactions,
-        error: prevError
-      } = await supabase
+      const { data: prevTransactions } = await supabase
         .from("transactions")
-        .select(
-          "amount, type, transaction_type, category, direction, created_at"
-        )
+        .select("amount, type, transaction_type, category, direction, created_at")
         .eq("user_id", userId)
-        .gte(
-          "created_at",
-          startOfPrevMonth.toISOString()
-        )
-        .lt(
-          "created_at",
-          startOfMonth.toISOString()
-        );
+        .gte("created_at", startOfPrevMonth.toISOString())
+        .lt("created_at", startOfMonth.toISOString());
 
-      if (prevError) {
-        console.error(
-          "SUMMARY PREV TRANSACTIONS ERROR:",
-          prevError
-        );
-      }
-
-      /* ---------------------------------------------
-         Compute totals (debits only)
-      --------------------------------------------- */
       function isDebit(tx) {
-        const direction = String(
-          tx?.direction || ""
-        ).toLowerCase();
-
-        if (
-          direction === "in" ||
-          direction === "incoming" ||
-          direction === "credit"
-        ) {
-          return false;
-        }
-
-        if (
-          direction === "out" ||
-          direction === "outgoing" ||
-          direction === "debit"
-        ) {
-          return true;
-        }
-
-        const type = String(
-          tx?.type ||
-            tx?.transaction_type ||
-            tx?.category ||
-            ""
-        ).toLowerCase();
-
-        if (
-          type.includes("deposit") ||
-          type.includes("credit") ||
-          type.includes("received") ||
-          type.includes("income")
-        ) {
-          return false;
-        }
-
-        if (
-          type.includes("withdraw") ||
-          type.includes("debit") ||
-          type.includes("expense") ||
-          type.includes("payment") ||
-          type.includes("purchase") ||
-          type.includes("transfer")
-        ) {
-          return true;
-        }
-
+        const direction = String(tx?.direction || "").toLowerCase();
+        if (["in", "incoming", "credit"].includes(direction)) return false;
+        if (["out", "outgoing", "debit"].includes(direction)) return true;
+        const type = String(tx?.type || tx?.transaction_type || tx?.category || "").toLowerCase();
+        if (type.includes("deposit") || type.includes("credit") || type.includes("received") || type.includes("income")) return false;
+        if (type.includes("withdraw") || type.includes("debit") || type.includes("expense") || type.includes("payment") || type.includes("purchase") || type.includes("transfer")) return true;
         return Number(tx?.amount || 0) < 0;
       }
 
       const sumDebits = (list) => {
-        if (!Array.isArray(list)) {
-          return 0;
-        }
-
+        if (!Array.isArray(list)) return 0;
         return list.reduce((total, tx) => {
-          if (!isDebit(tx)) {
-            return total;
-          }
-
+          if (!isDebit(tx)) return total;
           const value = Number(tx.amount || 0);
-
-          if (!Number.isFinite(value)) {
-            return total;
-          }
-
-          return total + Math.abs(value);
+          return total + (Number.isFinite(value) ? Math.abs(value) : 0);
         }, 0);
       };
 
-      const spendingThisMonth = sumDebits(
-        currentTransactions || []
-      );
+      const spendingThisMonth = sumDebits(currentTransactions || []);
+      const spendingLastMonth = sumDebits(prevTransactions || []);
 
-      const spendingLastMonth = sumDebits(
-        prevTransactions || []
-      );
-
-      /* ---------------------------------------------
-         Load budget (create default if missing)
-      --------------------------------------------- */
-      let monthlyLimit = 5000000;
-
+      let monthlyLimit = 5000;
       try {
-        const {
-          data: budgetRow,
-          error: budgetError
-        } = await supabase
-          .from("budgets")
-          .select("monthly_limit")
-          .eq("user_id", userId)
-          .maybeSingle();
-
-        if (budgetError) {
-          console.error(
-            "SUMMARY BUDGET LOOKUP ERROR:",
-            budgetError
-          );
-        } else if (budgetRow) {
-          const parsed = Number(
-            budgetRow.monthly_limit
-          );
-
-          if (Number.isFinite(parsed) && parsed > 0) {
-            monthlyLimit = parsed;
-          }
+        const { data: budgetRow } = await supabase.from("budgets").select("monthly_limit").eq("user_id", userId).maybeSingle();
+        if (budgetRow) {
+          const parsed = Number(budgetRow.monthly_limit);
+          if (Number.isFinite(parsed) && parsed > 0) monthlyLimit = parsed;
         } else {
-          /* Auto-create default budget row */
-          const {
-            error: createBudgetError
-          } = await supabase
-            .from("budgets")
-            .insert({
-              user_id: userId,
-              monthly_limit: monthlyLimit
-            });
-
-          if (createBudgetError) {
-            console.error(
-              "SUMMARY DEFAULT BUDGET CREATE ERROR:",
-              createBudgetError
-            );
-          }
+          await supabase.from("budgets").insert({ user_id: userId, monthly_limit: monthlyLimit });
         }
-      } catch (budgetException) {
-        console.error(
-          "SUMMARY BUDGET EXCEPTION:",
-          budgetException
-        );
-      }
+      } catch (budgetException) {}
 
-      const usedPercent =
-        monthlyLimit > 0
-          ? Math.min(
-              100,
-              Math.max(
-                0,
-                (spendingThisMonth /
-                  monthlyLimit) *
-                  100
-              )
-            )
-          : 0;
-
-      const change =
-        spendingThisMonth - spendingLastMonth;
-
+      const usedPercent = monthlyLimit > 0 ? Math.min(100, Math.max(0, (spendingThisMonth / monthlyLimit) * 100)) : 0;
+      const change = spendingThisMonth - spendingLastMonth;
       let changePercent = 0;
-
-      if (spendingLastMonth > 0) {
-        changePercent =
-          (change / spendingLastMonth) * 100;
-      } else if (spendingThisMonth > 0) {
-        changePercent = 100;
-      }
+      if (spendingLastMonth > 0) changePercent = (change / spendingLastMonth) * 100;
+      else if (spendingThisMonth > 0) changePercent = 100;
 
       return res.json({
         success: true,
         period: {
-          month_label: now.toLocaleDateString(
-            "en-US",
-            { month: "long" }
-          ),
+          month_label: now.toLocaleDateString("en-US", { month: "long" }),
           year: now.getUTCFullYear(),
           start: startOfMonth.toISOString(),
-          end_exclusive:
-            startOfNextMonth.toISOString()
+          end_exclusive: startOfNextMonth.toISOString()
         },
         spending: {
-          this_month: Number(
-            spendingThisMonth.toFixed(2)
-          ),
-          last_month: Number(
-            spendingLastMonth.toFixed(2)
-          ),
+          this_month: Number(spendingThisMonth.toFixed(2)),
+          last_month: Number(spendingLastMonth.toFixed(2)),
           change: Number(change.toFixed(2)),
-          change_percent: Number(
-            changePercent.toFixed(2)
-          )
+          change_percent: Number(changePercent.toFixed(2))
         },
         budget: {
-          monthly_limit: Number(
-            monthlyLimit.toFixed(2)
-          ),
-          used: Number(
-            spendingThisMonth.toFixed(2)
-          ),
-          used_percent: Number(
-            usedPercent.toFixed(2)
-          ),
-          remaining: Number(
-            Math.max(
-              0,
-              monthlyLimit - spendingThisMonth
-            ).toFixed(2)
-          )
+          monthly_limit: Number(monthlyLimit.toFixed(2)),
+          used: Number(spendingThisMonth.toFixed(2)),
+          used_percent: Number(usedPercent.toFixed(2)),
+          remaining: Number(Math.max(0, monthlyLimit - spendingThisMonth).toFixed(2))
         }
       });
     } catch (error) {
-      console.error(
-        "DASHBOARD SUMMARY ERROR:",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Unable to load dashboard summary",
-        error: error.message
-      });
+      return res.status(500).json({ success: false, message: "Unable to load dashboard summary" });
     }
   }
 );
@@ -4388,120 +3858,27 @@ app.patch(
   async (req, res) => {
     try {
       const userId = req.user.id;
-
       const { monthly_limit } = req.body || {};
-
       const parsed = Number(monthly_limit);
 
-      if (
-        !Number.isFinite(parsed) ||
-        parsed < 0
-      ) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "monthly_limit must be a non-negative number"
-        });
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        return res.status(400).json({ success: false, message: "monthly_limit must be a non-negative number" });
       }
 
-      /* Upsert: create if missing, update if present */
-      const {
-        data: existing,
-        error: lookupError
-      } = await supabase
-        .from("budgets")
-        .select("id")
-        .eq("user_id", userId)
-        .maybeSingle();
-
-      if (lookupError) {
-        console.error(
-          "BUDGET UPDATE LOOKUP ERROR:",
-          lookupError
-        );
-
-        return res.status(500).json({
-          success: false,
-          message:
-            "Unable to load current budget",
-          error: lookupError.message
-        });
-      }
+      const { data: existing } = await supabase.from("budgets").select("id").eq("user_id", userId).maybeSingle();
 
       let savedBudget = null;
-
       if (existing) {
-        const { data, error } = await supabase
-          .from("budgets")
-          .update({
-            monthly_limit: parsed,
-            updated_at: new Date().toISOString()
-          })
-          .eq("id", existing.id)
-          .eq("user_id", userId)
-          .select()
-          .single();
-
-        if (error) {
-          console.error(
-            "BUDGET UPDATE ERROR:",
-            error
-          );
-
-          return res.status(500).json({
-            success: false,
-            message: "Unable to update budget",
-            error: error.message
-          });
-        }
-
+        const { data } = await supabase.from("budgets").update({ monthly_limit: parsed, updated_at: new Date().toISOString() }).eq("id", existing.id).select().single();
         savedBudget = data;
       } else {
-        const { data, error } = await supabase
-          .from("budgets")
-          .insert({
-            user_id: userId,
-            monthly_limit: parsed
-          })
-          .select()
-          .single();
-
-        if (error) {
-          console.error(
-            "BUDGET INSERT ERROR:",
-            error
-          );
-
-          return res.status(500).json({
-            success: false,
-            message: "Unable to create budget",
-            error: error.message
-          });
-        }
-
+        const { data } = await supabase.from("budgets").insert({ user_id: userId, monthly_limit: parsed }).select().single();
         savedBudget = data;
       }
 
-      return res.json({
-        success: true,
-        message: "Budget updated successfully",
-        budget: {
-          monthly_limit: Number(
-            savedBudget.monthly_limit
-          )
-        }
-      });
+      return res.json({ success: true, message: "Budget updated successfully", budget: { monthly_limit: Number(savedBudget.monthly_limit) } });
     } catch (error) {
-      console.error(
-        "BUDGET UPDATE EXCEPTION:",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message: "Unable to update budget",
-        error: error.message
-      });
+      return res.status(500).json({ success: false, message: "Unable to update budget" });
     }
   }
 );
@@ -4513,8 +3890,7 @@ app.patch(
 app.use((req, res) => {
   res.status(404).json({
     success: false,
-    message:
-      `Route not found: ${req.method} ${req.originalUrl}`
+    message: `Route not found: ${req.method} ${req.originalUrl}`
   });
 });
 
@@ -4523,20 +3899,9 @@ app.use((req, res) => {
 ===================================================== */
 
 app.use((error, req, res, next) => {
-  console.error(
-    "UNHANDLED SERVER ERROR:",
-    error
-  );
-
-  if (res.headersSent) {
-    return next(error);
-  }
-
-  res.status(500).json({
-    success: false,
-    message: "Internal server error",
-    error: error.message
-  });
+  console.error("UNHANDLED SERVER ERROR:", error);
+  if (res.headersSent) return next(error);
+  res.status(500).json({ success: false, message: "Internal server error", error: error.message });
 });
 
 /* =====================================================
@@ -4544,7 +3909,5 @@ app.use((error, req, res, next) => {
 ===================================================== */
 
 app.listen(PORT, () => {
-  console.log(
-    `Crest United Bank API running on port ${PORT}`
-  );
+  console.log(`Crest United Bank API running on port ${PORT}`);
 });
