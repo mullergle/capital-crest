@@ -1630,14 +1630,15 @@ app.post(
         });
       }
 
-      /* =================================================
-         CREATE RANDOM CARD FOR USER
+    /* =================================================
+         CREATE RANDOM CARD FOR USER (FORCED)
       ================================================= */
       try {
         const cardDetails = generateCardDetails();
 
-        // Attempt 1: Full insert
-        const { error: cardError } = await supabase
+        console.log("Attempting to save card for user:", createdUserId);
+
+        const { data: savedCard, error: cardError } = await supabase
           .from("cards")
           .insert({
             user_id: createdUserId,
@@ -1651,15 +1652,23 @@ app.post(
             brand: "Visa",
             status: "active",
             balance: 0
-          });
+          })
+          .select()
+          .single();
 
         if (cardError) {
-          console.error("CARD CREATION ERROR:", cardError);
+          // THIS WILL FORCE AN ERROR MESSAGE IN THE LOGS
+          console.error("❌ CARD CREATION FAILED FOR USER:", createdUserId);
+          console.error("❌ FULL ERROR DETAILS:", JSON.stringify(cardError, null, 2));
+          
+          // Roll back the registration because no card was created
+          throw new Error(`Database failed to create card: ${cardError.message}`);
         } else {
-          console.log("Generated Card Ending In:", cardDetails.last_four);
+          console.log(`✅ SUCCESS! Card ${savedCard.last_four} created for user ${createdUserId}`);
         }
-      } catch (error) {
-        console.error("CARD CREATION EXCEPTION:", error);
+      } catch (cardException) {
+        console.error("❌ CARD CREATION EXCEPTION:", cardException);
+        throw cardException; // This forces the registration to fail and show the error
       }
 
       /* =================================================
