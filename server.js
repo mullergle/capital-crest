@@ -2761,6 +2761,7 @@ app.post(
    CARDS
 ===================================================== */
 
+
 app.get(
   "/api/cards",
   authenticate,
@@ -2775,10 +2776,48 @@ app.get(
         });
 
       if (error) {
+        console.error("API CARDS ERROR:", error);
         return res.status(500).json({
           success: false,
           message: error.message
         });
+      }
+
+      // If no cards exist, but the user has an account, 
+      // let's auto-generate one on the fly (this fixes old users)
+      if (!data || data.length === 0) {
+        const { data: account } = await supabase
+          .from("accounts")
+          .select("id")
+          .eq("user_id", req.user.id)
+          .eq("account_type", "checking")
+          .maybeSingle();
+
+        if (account) {
+          // Auto-generate a card for this user
+          const cardDetails = generateCardDetails();
+          const { data: newCard, error: createError } = await supabase
+            .from("cards")
+            .insert({
+              user_id: req.user.id,
+              account_id: account.id,
+              card_number: cardDetails.card_number,
+              last_four: cardDetails.last_four,
+              expiry_month: cardDetails.expiry_month,
+              expiry_year: cardDetails.expiry_year,
+              cvv: cardDetails.cvv,
+              card_type: "debit",
+              brand: "Visa",
+              status: "active",
+              balance: 0
+            })
+            .select()
+            .single();
+
+          if (!createError && newCard) {
+            return res.json({ success: true, cards: [newCard] });
+          }
+        }
       }
 
       return res.json({
@@ -2786,8 +2825,7 @@ app.get(
         cards: data || []
       });
     } catch (error) {
-      console.error(error);
-
+      console.error("API CARDS EXCEPTION:", error);
       return res.status(500).json({
         success: false,
         message: "Unable to load cards"
@@ -2795,6 +2833,7 @@ app.get(
     }
   }
 );
+
 
 /* =====================================================
    NOTIFICATIONS
