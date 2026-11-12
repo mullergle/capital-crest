@@ -2463,7 +2463,7 @@ app.delete(
 );
 
 /* =====================================================
-   TRANSFERS (UPDATED WITH ACCOUNT NAME)
+   TRANSFERS (UPDATED WITH FULL RECIPIENT DETAILS)
 ===================================================== */
 
 app.post(
@@ -2622,6 +2622,7 @@ app.post(
         }
       }
 
+      // ✅ RETURN FULL RECIPIENT DETAILS for the receipt
       return res.status(201).json({
         success: true,
         message: "Transfer verification required",
@@ -2631,11 +2632,12 @@ app.post(
           amount: transfer.amount,
           currency: transfer.currency,
           status: transfer.status,
-          recipient: {
-            name: transfer.recipient_name,
-            bank_name: transfer.recipient_bank_name,
-            account_number: transfer.recipient_account_number
-          }
+          description: `External transfer to ${transfer.recipient_bank_name} (${transfer.recipient_account_number})`,
+          recipient_name: transfer.recipient_name,
+          recipient_bank_name: transfer.recipient_bank_name,
+          recipient_account_number: transfer.recipient_account_number,
+          recipient_swift_code: transfer.recipient_swift_code,
+          recipient_routing_number: transfer.recipient_routing_number
         },
         verification: {
           required: true,
@@ -2653,7 +2655,7 @@ app.post(
 );
 
 /* =====================================================
-   VERIFY TRANSFER
+   VERIFY TRANSFER (UPDATED WITH FULL RECIPIENT DETAILS)
 ===================================================== */
 
 app.post(
@@ -2736,21 +2738,27 @@ app.post(
         .update({ available_balance: Number(senderBal.available_balance) - Number(transfer.amount), updated_at: now })
         .eq("account_id", senderAcc.id);
 
-      // Log Sender Transaction
+      // Log Sender Transaction with FULL recipient details for the receipt
       await supabase.from("transactions").insert({
-          user_id: req.user.id,
-          account_id: senderAcc.id,
-          amount: transfer.amount,
-          type: "Transfer Out",
-          direction: "out",
-          description: `External transfer to ${transfer.recipient_bank_name} (${transfer.recipient_account_number})`,
-          status: "completed"
+        user_id: req.user.id,
+        account_id: senderAcc.id,
+        amount: transfer.amount,
+        type: "Transfer Out",
+        direction: "out",
+        description: `External transfer to ${transfer.recipient_bank_name} (${transfer.recipient_account_number})`,
+        status: "completed",
+        recipient_name: transfer.recipient_name,
+        recipient_bank_name: transfer.recipient_bank_name,
+        recipient_account_number: transfer.recipient_account_number,
+        recipient_swift_code: transfer.recipient_swift_code,
+        recipient_routing_number: transfer.recipient_routing_number
       });
 
       // Mark verification & transfer as complete
       await supabase.from("transfer_verifications").update({ verified_at: now }).eq("id", verification.id);
       const { data: updatedTransfer } = await supabase.from("transfers").update({ status: "completed" }).eq("id", transfer_id).select().single();
 
+      // ✅ RETURN ALL RECIPIENT DETAILS for the receipt
       return res.status(200).json({
         success: true,
         message: "Transfer verification successful",
@@ -2759,7 +2767,15 @@ app.post(
           reference: updatedTransfer.reference,
           amount: updatedTransfer.amount,
           currency: updatedTransfer.currency,
-          status: updatedTransfer.status
+          status: updatedTransfer.status,
+          created_at: updatedTransfer.created_at,
+          description: `External transfer to ${updatedTransfer.recipient_bank_name} (${updatedTransfer.recipient_account_number})`,
+          // ✅ Full recipient details
+          recipient_name: updatedTransfer.recipient_name,
+          recipient_bank_name: updatedTransfer.recipient_bank_name,
+          recipient_account_number: updatedTransfer.recipient_account_number,
+          recipient_swift_code: updatedTransfer.recipient_swift_code,
+          recipient_routing_number: updatedTransfer.recipient_routing_number
         }
       });
     } catch (error) {
