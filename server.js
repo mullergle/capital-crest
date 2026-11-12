@@ -2310,9 +2310,42 @@ app.get(
         });
       }
 
+      // ✅ MERGE transfer details into transactions
+      // Fetch matching transfers for this user so receipts have full data
+      const { data: transfers } = await supabase
+        .from("transfers")
+        .select("id, reference, amount, recipient_name, recipient_bank_name, recipient_account_number, recipient_swift_code, recipient_routing_number, created_at, status")
+        .eq("sender_user_id", req.user.id);
+
+      const enrichedTransactions = (data || []).map(tx => {
+        // Try to find a matching transfer by amount, date, or description
+        const matchingTransfer = (transfers || []).find(t => {
+          const txTime = new Date(tx.created_at).getTime();
+          const trfTime = new Date(t.created_at).getTime();
+          const timeDiff = Math.abs(txTime - trfTime);
+          const sameAmount = Math.abs(Number(tx.amount) - Number(t.amount)) < 0.01;
+          // Match if amount is same AND created within 60 seconds of each other
+          return sameAmount && timeDiff < 60000;
+        });
+
+        if (matchingTransfer) {
+          return {
+            ...tx,
+            // Override with real transfer data
+            recipient_name: matchingTransfer.recipient_name || tx.recipient_name,
+            recipient_bank_name: matchingTransfer.recipient_bank_name || tx.recipient_bank_name,
+            recipient_account_number: matchingTransfer.recipient_account_number || tx.recipient_account_number,
+            recipient_swift_code: matchingTransfer.recipient_swift_code || tx.recipient_swift_code,
+            recipient_routing_number: matchingTransfer.recipient_routing_number || tx.recipient_routing_number,
+            reference: matchingTransfer.reference || tx.reference
+          };
+        }
+        return tx;
+      });
+
       return res.json({
         success: true,
-        transactions: data || []
+        transactions: enrichedTransactions
       });
     } catch (error) {
       console.error(error);
