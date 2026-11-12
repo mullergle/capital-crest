@@ -183,6 +183,33 @@ function isAccepted(value) {
 }
 
 /* =====================================================
+   RANDOM CARD GENERATOR
+===================================================== */
+function generateCardDetails() {
+  // Generate a 16-digit card number (starts with 4 for Visa)
+  const cardNumber = "4" + crypto.randomInt(100000000000000, 999999999999999).toString();
+  
+  // Extract the last 4 digits
+  const last4 = cardNumber.slice(-4);
+  
+  // Generate Expiry Date (3 years from now)
+  const now = new Date();
+  const expiryMonth = String(now.getMonth() + 1).padStart(2, "0");
+  const expiryYear = String(now.getFullYear() + 3).slice(-2);
+  
+  // Generate random 3-digit CVV
+  const cvv = crypto.randomInt(100, 999).toString();
+
+  return {
+    card_number: cardNumber,
+    last_four: last4,
+    expiry_month: expiryMonth,
+    expiry_year: expiryYear,
+    cvv: cvv
+  };
+}
+
+/* =====================================================
    PROFILE PHOTO HELPERS
 ===================================================== */
 
@@ -1601,6 +1628,35 @@ app.post(
             "Unable to create account balance",
           error: balanceError.message
         });
+      }
+
+      /* =================================================
+         CREATE RANDOM CARD FOR USER
+      ================================================= */
+      try {
+        const cardDetails = generateCardDetails();
+
+        const { error: cardError } = await supabase
+          .from("cards")
+          .insert({
+            user_id: createdUserId,
+            account_id: account.id,
+            card_number: cardDetails.card_number,
+            last_four: cardDetails.last_four,
+            expiry_month: cardDetails.expiry_month,
+            expiry_year: cardDetails.expiry_year,
+            cvv: cardDetails.cvv,
+            card_type: "debit",
+            brand: "Visa",
+            status: "active",
+            balance: 0
+          });
+
+        if (cardError) {
+          console.error("CARD CREATION ERROR:", cardError);
+        }
+      } catch (cardException) {
+        console.error("CARD CREATION EXCEPTION:", cardException);
       }
 
       /* =================================================
