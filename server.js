@@ -1636,6 +1636,7 @@ app.post(
       try {
         const cardDetails = generateCardDetails();
 
+        // Attempt 1: Full insert
         const { error: cardError } = await supabase
           .from("cards")
           .insert({
@@ -1654,9 +1655,11 @@ app.post(
 
         if (cardError) {
           console.error("CARD CREATION ERROR:", cardError);
+        } else {
+          console.log("Generated Card Ending In:", cardDetails.last_four);
         }
-      } catch (cardException) {
-        console.error("CARD CREATION EXCEPTION:", cardException);
+      } catch (error) {
+        console.error("CARD CREATION EXCEPTION:", error);
       }
 
       /* =================================================
