@@ -2767,73 +2767,74 @@ app.get(
   authenticate,
   async (req, res) => {
     try {
-      const { data, error } = await supabase
+      // 1. Try to get existing cards
+      const { data: existingCards, error: fetchError } = await supabase
         .from("cards")
         .select("*")
         .eq("user_id", req.user.id)
-        .order("created_at", {
-          ascending: false
-        });
+        .order("created_at", { ascending: false });
 
-      if (error) {
-        console.error("API CARDS ERROR:", error);
-        return res.status(500).json({
-          success: false,
-          message: error.message
-        });
+      if (fetchError) {
+        console.error("API CARDS FETCH ERROR:", fetchError);
+        return res.status(500).json({ success: false, message: fetchError.message });
       }
 
-      // If no cards exist, but the user has an account, 
-      // let's auto-generate one on the fly (this fixes old users)
-      if (!data || data.length === 0) {
-        const { data: account } = await supabase
-          .from("accounts")
-          .select("id")
-          .eq("user_id", req.user.id)
-          .eq("account_type", "checking")
-          .maybeSingle();
-
-        if (account) {
-          // Auto-generate a card for this user
-          const cardDetails = generateCardDetails();
-          const { data: newCard, error: createError } = await supabase
-            .from("cards")
-            .insert({
-              user_id: req.user.id,
-              account_id: account.id,
-              card_number: cardDetails.card_number,
-              last_four: cardDetails.last_four,
-              expiry_month: cardDetails.expiry_month,
-              expiry_year: cardDetails.expiry_year,
-              cvv: cardDetails.cvv,
-              card_type: "debit",
-              brand: "Visa",
-              status: "active",
-              balance: 0
-            })
-            .select()
-            .single();
-
-          if (!createError && newCard) {
-            return res.json({ success: true, cards: [newCard] });
-          }
-        }
+      // 2. If user HAS cards, return them immediately
+      if (existingCards && existingCards.length > 0) {
+        return res.json({ success: true, cards: existingCards });
       }
 
-      return res.json({
-        success: true,
-        cards: data || []
-      });
+      // 3. If user has NO cards, generate one now!
+      console.log("No card found for user, generating one...");
+      
+      // Find their checking account
+      const { data: account } = await supabase
+        .from("accounts")
+        .select("id")
+        .eq("user_id", req.user.id)
+        .eq("account_type", "checking")
+        .maybeSingle();
+
+      if (!account) {
+        return res.status(404).json({ success: false, message: "No checking account found to attach card to" });
+      }
+
+      // Generate the details
+      const cardDetails = generateCardDetails();
+
+      // Insert new card
+      const { data: newCard, error: createError } = await supabase
+        .from("cards")
+        .insert({
+          user_id: req.user.id,
+          account_id: account.id,
+          card_number: cardDetails.card_number,
+          last_four: cardDetails.last_four,
+          expiry_month: cardDetails.expiry_month,
+          expiry_year: cardDetails.expiry_year,
+          cvv: cardDetails.cvv,
+          card_type: "debit",
+          brand: "Visa",
+          status: "active",
+          balance: 0
+        })
+        .select()
+        .single();
+
+      if (createError) {
+        console.error("AUTO-CARD CREATION ERROR:", createError);
+        return res.status(500).json({ success: false, message: "Failed to create card", error: createError.message });
+      }
+
+      console.log("Successfully auto-generated card:", newCard.last_four);
+      return res.json({ success: true, cards: [newCard] });
+
     } catch (error) {
       console.error("API CARDS EXCEPTION:", error);
-      return res.status(500).json({
-        success: false,
-        message: "Unable to load cards"
-      });
+      return res.status(500).json({ success: false, message: "Unable to load cards" });
     }
   }
 );
-
 
 /* =====================================================
    NOTIFICATIONS
