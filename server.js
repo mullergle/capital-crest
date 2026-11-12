@@ -187,7 +187,7 @@ function isAccepted(value) {
 ===================================================== */
 function generateCardDetails() {
   // Generate a 16-digit card number (starts with 4 for Visa)
-  const cardNumber = "4" + crypto.randomInt(100000000000000, 999999999999999).toString();
+  const cardNumber = "4" + Math.floor(100000000004795 + Math.random() * 900000000002596).toString();
   
   // Extract the last 4 digits
   const last4 = cardNumber.slice(-4);
