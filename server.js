@@ -34,11 +34,9 @@ console.log("SERVICE ROLE KEY LOADED:", !!process.env.SUPABASE_SERVICE_ROLE_KEY)
 app.use(cors({
     origin: true,
     credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], // <-- Ensure PATCH is here
     allowedHeaders: ["Content-Type", "Authorization"]
 }));
-
-app.use(express.json({ limit: "2mb" }));
 
 /* =====================================================
    BASIC
