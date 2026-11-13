@@ -1254,6 +1254,72 @@ app.put("/api/admin/users/:id/balances", authenticateAdmin, async (req, res) => 
 });
 
 /* =====================================================
+   ADMIN — UPDATE USER PROFILE PHOTO
+===================================================== */
+app.post("/api/admin/users/:id/photo", authenticateAdmin, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const { image } = req.body || {};
+
+    if (!image || typeof image !== "string") {
+      return res.status(400).json({ success: false, message: "Profile photo is required" });
+    }
+
+    const match = image.match(/^data:(image\/jpeg|image\/jpg|image\/png|image\/webp);base64,(.+)$/);
+    if (!match) {
+      return res.status(400).json({ success: false, message: "Invalid profile photo format" });
+    }
+
+    const imageBuffer = Buffer.from(match[2], "base64");
+    if (!imageBuffer.length) {
+      return res.status(400).json({ success: false, message: "Profile photo is empty" });
+    }
+    if (imageBuffer.length > PROFILE_PHOTO_MAX_BYTES) {
+      return res.status(400).json({ success: false, message: "Profile photo must be smaller than 1.5MB" });
+    }
+
+    // Upload to Supabase Storage (reusing the existing bucket)
+    const avatarPath = `${userId}/avatar.jpg`;
+    const { error: uploadError } = await supabase.storage
+      .from(PROFILE_PHOTO_BUCKET)
+      .upload(avatarPath, imageBuffer, {
+        contentType: "image/jpeg",
+        cacheControl: "3600",
+        upsert: true
+      });
+
+    if (uploadError) {
+      console.error("ADMIN PHOTO UPLOAD ERROR:", uploadError);
+      return res.status(500).json({ success: false, message: "Unable to upload photo" });
+    }
+
+    const avatarUrl = getProfileAvatarUrl(avatarPath);
+
+    // Save to the user's profile
+    const { error: profileUpdateError } = await supabase
+      .from("profiles")
+      .update({ avatar_path: avatarPath, avatar_url: avatarUrl })
+      .eq("id", userId);
+
+    if (profileUpdateError) {
+      console.error("ADMIN PHOTO PROFILE UPDATE ERROR:", profileUpdateError);
+      return res.status(500).json({ success: false, message: "Photo uploaded but profile could not be updated" });
+    }
+
+    return res.json({
+      success: true,
+      message: "Profile photo updated successfully",
+      avatar_url: avatarUrl
+    });
+  } catch (error) {
+    console.error("ADMIN PHOTO EXCEPTION:", error);
+    return res.status(500).json({ success: false, message: "Unable to update profile photo" });
+  }
+});
+
+
+
+/* =====================================================
    ADMIN — DEPOSIT FUNDS
 ===================================================== */
 
