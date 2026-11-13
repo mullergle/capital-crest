@@ -140,6 +140,21 @@ function generateReference(prefix = "STL") {
     .toUpperCase()}`;
 }
 
+function formatMoneyServer(amount) {
+  const n = Number(amount);
+  const safe = Number.isFinite(n) ? n : 0;
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(safe);
+  } catch (e) {
+    return `$${safe.toFixed(2)}`;
+  }
+}
+
 function isAdminValue(value) {
   if (value === true) return true;
   if (value === 1) return true;
@@ -3703,6 +3718,215 @@ app.put(
       });
     }
   }
+);
+
+/* =====================================================
+   ADMIN — DEPOSIT FUNDS (with depositor name / receipt)
+===================================================== */
+
+async function handleAdminDeposit(req, res) {
+  try {
+    const userId = req.params.id;
+
+    const {
+      account_type,
+      amount,
+      depositor_name,
+      description,
+      note,
+      reference: clientReference
+    } = req.body || {};
+
+    /* ---------- Validation ---------- */
+    const type = String(account_type || "checking").trim().toLowerCase();
+    const depositAmount = Number(amount);
+    const depositorName = String(depositor_name || "").trim();
+    const cleanNote = String(note || "").trim();
+    const cleanDescription =
+      String(description || "").trim() ||
+      `Deposit from ${depositorName}`;
+
+    if (!["checking", "savings", "card"].includes(type)) {
+      return res.status(400).json({
+        success: false,
+        message: "account_type must be checking, savings, or card"
+      });
+    }
+
+    if (!Number.isFinite(depositAmount) || depositAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Amount must be a number greater than zero"
+      });
+    }
+
+    if (depositAmount > 100000000) {
+      return res.status(400).json({
+        success: false,
+        message: "Amount is too large"
+      });
+    }
+
+    if (depositorName.length < 2) {
+      return res.status(400).json({
+        success: false,
+        message: "Depositor name is required (min 2 characters)"
+      });
+    }
+
+    if (depositorName.length > 80) {
+      return res.status(400).json({
+        success: false,
+        message: "Depositor name is too long (max 80 characters)"
+      });
+    }
+
+    /* ---------- Ensure target user exists & is not admin ---------- */
+    const { data: profile, error: profileError } = await supabase
+      .from("profiles")
+      .select("id, is_admin")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (profileError) {
+      return res.status(500).json({
+        success: false,
+        message: profileError.message
+      });
+    }
+
+    if (!profile) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+
+    if (isAdminValue(profile.is_admin)) {
+      return res.status(403).json({
+        success: false,
+        message: "Administrator accounts cannot be deposited into here"
+      });
+    }
+
+    /* ---------- Find the target account ---------- */
+    const { data: accounts, error: accountsError } = await supabase
+      .from("accounts")
+      .select("*")
+      .eq("user_id", userId);
+
+    if (accountsError) {
+      return res.status(500).json({
+        success: false,
+        message: accountsError.message
+      });
+    }
+
+    const accountList = accounts || [];
+
+    let targetAccount = null;
+
+    if (type === "checking") {
+      targetAccount = accountList.find(
+        a => String(a.account_type || "").toLowerCase() === "checking"
+      );
+    } else if (type === "savings") {
+      targetAccount = accountList.find(a => {
+        const t = String(a.account_type || "").toLowerCase();
+        return t === "savings" || t === "saving";
+      });
+    }
+
+    if (!targetAccount) {
+      return res.status(404).json({
+        success: false,
+        message: `${type} account not found for this user`
+      });
+    }
+
+    /* ---------- Build the reference ---------- */
+    const reference =
+      String(clientReference || "").trim() ||
+      generateReference("DEP");
+
+    /* ---------- Insert the transaction record (receipt) ---------- */
+    // depositor_name is stored in BOTH recipient_name (existing column)
+    // and depositor_name (new column) so the user history page can
+    // display it no matter which field it reads.
+    const transactionRow = {
+      user_id: userId,
+      account_id: targetAccount.id,
+      amount: depositAmount,
+      type: "Deposit",
+      direction: "in",
+      description: cleanDescription,
+      status: "completed",
+      reference: reference,
+      depositor_name: depositorName,
+      note: cleanNote || null,
+      account_type: type,
+      created_by: "admin",
+      recipient_name: depositorName
+    };
+
+    const { data: savedTransaction, error: txError } = await supabase
+      .from("transactions")
+      .insert(transactionRow)
+      .select()
+      .single();
+
+    if (txError) {
+      console.error("ADMIN DEPOSIT TX INSERT ERROR:", txError);
+      return res.status(500).json({
+        success: false,
+        message:
+          "Unable to save deposit receipt: " + txError.message,
+        error: txError.message
+      });
+    }
+
+    /* ---------- Add a notification for the customer ---------- */
+    try {
+      await supabase.from("notifications").insert({
+        user_id: userId,
+        title: "Deposit Received",
+        message: `${formatMoneyServer(depositAmount)} was deposited into your ${type} account by ${depositorName}. Ref: ${reference}`,
+        type: "transaction"
+      });
+    } catch (notifyError) {
+      console.error("ADMIN DEPOSIT NOTIFICATION ERROR:", notifyError);
+    }
+
+    /* ---------- Respond ---------- */
+    return res.status(201).json({
+      success: true,
+      message: "Deposit recorded successfully",
+      reference: reference,
+      transaction: savedTransaction
+    });
+
+  } catch (error) {
+    console.error("ADMIN DEPOSIT EXCEPTION:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Unable to process deposit",
+      error: error.message
+    });
+  }
+}
+
+/* Primary deposits endpoint */
+app.post(
+  "/api/admin/users/:id/deposits",
+  authenticateAdmin,
+  handleAdminDeposit
+);
+
+/* Fallback endpoint — the frontend calls this if /deposits 404s */
+app.post(
+  "/api/admin/users/:id/transactions",
+  authenticateAdmin,
+  handleAdminDeposit
 );
 
 /* =====================================================
