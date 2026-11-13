@@ -2582,6 +2582,36 @@ app.post(
         });
       }
 
+      /* 🚨 CHECK MONTHLY TRANSFER LIMIT 🚨 */
+      const TRANSFER_LIMIT = 5000000; // $5,000,000
+      
+      const now = new Date();
+      const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0)).toISOString();
+      const startOfNextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, 0, 0, 0, 0)).toISOString();
+
+      const { data: monthlyTransfers, error: limitError } = await supabase
+        .from("transfers")
+        .select("amount")
+        .eq("sender_user_id", req.user.id)
+        .eq("status", "completed")
+        .gte("created_at", startOfMonth)
+        .lt("created_at", startOfNextMonth);
+
+      if (limitError) {
+        console.error("LIMIT CHECK ERROR:", limitError);
+        return res.status(500).json({ success: false, message: "Unable to verify transfer limits." });
+      }
+
+      const totalSentThisMonth = (monthlyTransfers || []).reduce((sum, tx) => sum + Number(tx.amount), 0);
+      
+      if (totalSentThisMonth + transferAmount > TRANSFER_LIMIT) {
+        return res.status(400).json({
+          success: false,
+          message: `Transfer limit exceeded. You have $${(TRANSFER_LIMIT - totalSentThisMonth).toLocaleString()} remaining for this month.`
+        });
+      }
+      /* 🚨 END LIMIT CHECK 🚨 */
+
       const reference = generateReference("TRF");
 
       const { data: transfer, error: transferError } = await supabase
