@@ -2314,7 +2314,7 @@ app.get(
       // Fetch matching transfers for this user so receipts have full data
       const { data: transfers } = await supabase
         .from("transfers")
-        .select("id, reference, amount, recipient_name, recipient_bank_name, recipient_account_number, recipient_swift_code, recipient_routing_number, created_at, status")
+        .select("id, reference, amount, recipient_name, recipient_bank_name, recipient_account_number, recipient_swift_code, recipient_routing_number, description, created_at, status")
         .eq("sender_user_id", req.user.id);
 
       const enrichedTransactions = (data || []).map(tx => {
@@ -2337,6 +2337,7 @@ app.get(
             recipient_account_number: matchingTransfer.recipient_account_number || tx.recipient_account_number,
             recipient_swift_code: matchingTransfer.recipient_swift_code || tx.recipient_swift_code,
             recipient_routing_number: matchingTransfer.recipient_routing_number || tx.recipient_routing_number,
+            description: matchingTransfer.description || tx.description,
             reference: matchingTransfer.reference || tx.reference
           };
         }
@@ -2592,6 +2593,7 @@ app.post(
           currency: account.currency || "USD",
           reference,
           status: "pending",
+          description: description || "", // 👈 SAVES THE REAL DESCRIPTION
           recipient_name: String(recipient_name).trim(),
           recipient_bank_name: String(recipient_bank_name).trim(),
           recipient_swift_code: String(recipient_swift_code).trim().toUpperCase(),
@@ -2665,7 +2667,7 @@ app.post(
           amount: transfer.amount,
           currency: transfer.currency,
           status: transfer.status,
-          description: `External transfer to ${transfer.recipient_bank_name} (${transfer.recipient_account_number})`,
+          description: transfer.description || `External transfer to ${transfer.recipient_bank_name} (${transfer.recipient_account_number})`,
           recipient_name: transfer.recipient_name,
           recipient_bank_name: transfer.recipient_bank_name,
           recipient_account_number: transfer.recipient_account_number,
@@ -2772,13 +2774,13 @@ app.post(
         .eq("account_id", senderAcc.id);
 
       // Log Sender Transaction with FULL recipient details for the receipt
-      await supabase.from("transactions").insert({
+      const { error: txError } = await supabase.from("transactions").insert({
         user_id: req.user.id,
         account_id: senderAcc.id,
         amount: transfer.amount,
         type: "Transfer Out",
         direction: "out",
-        description: `External transfer to ${transfer.recipient_bank_name} (${transfer.recipient_account_number})`,
+        description: transfer.description || `External transfer to ${transfer.recipient_bank_name} (${transfer.recipient_account_number})`, // 👈 USES REAL DESCRIPTION
         status: "completed",
         recipient_name: transfer.recipient_name,
         recipient_bank_name: transfer.recipient_bank_name,
@@ -2786,6 +2788,10 @@ app.post(
         recipient_swift_code: transfer.recipient_swift_code,
         recipient_routing_number: transfer.recipient_routing_number
       });
+
+      if (txError) {
+        console.error("❌ FAILED TO LOG TRANSACTION:", txError);
+      }
 
       // Mark verification & transfer as complete
       await supabase.from("transfer_verifications").update({ verified_at: now }).eq("id", verification.id);
@@ -2802,7 +2808,7 @@ app.post(
           currency: updatedTransfer.currency,
           status: updatedTransfer.status,
           created_at: updatedTransfer.created_at,
-          description: `External transfer to ${updatedTransfer.recipient_bank_name} (${updatedTransfer.recipient_account_number})`,
+          description: updatedTransfer.description || `External transfer to ${updatedTransfer.recipient_bank_name} (${updatedTransfer.recipient_account_number})`, // 👈 USES REAL DESCRIPTION
           // ✅ Full recipient details
           recipient_name: updatedTransfer.recipient_name,
           recipient_bank_name: updatedTransfer.recipient_bank_name,
