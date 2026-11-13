@@ -10,6 +10,9 @@ const app = express();
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 const CODE_EXPIRY = 10 * 60 * 1000;
+
+// Email sending disabled until
+// your sending domain is ready.
 const SEND_TRANSFER_OTP_EMAIL = true;
 
 /* =====================================================
@@ -502,7 +505,7 @@ app.post("/api/auth/login", async (req, res) => {
 
       if (error || !data?.user || !data?.session) return res.status(401).json({ success: false, message: "Invalid email or password" });
 
-      const { data: profile, error: profileError } = await supabase.from("profiles").select("id, first_name, surname, phone, is_admin, avatar_path").eq("id", data.user.id).maybeSingle();
+      const { data: profile, error: profileError } = await supabase.from("profiles").select("id, first_name, surname, phone, is_admin, avatar_path, savings_pin_hash").eq("id", data.user.id).maybeSingle();
       if (profileError) return res.status(500).json({ success: false, message: "Unable to verify account", error: profileError.message });
       if (!profile) return res.status(403).json({ success: false, message: "User profile not found" });
 
@@ -590,10 +593,10 @@ app.get("/api/auth/me", authenticate, async (req, res) => {
 });
 
 /* =====================================================
-   SAVINGS PIN SETUP (WITH EMAIL OTP)
+   SAVINGS — PIN SETUP, OTP & TRANSFERS
 ===================================================== */
 
-// 1. Send OTP to Email
+// 1. Send OTP for PIN change
 app.post("/api/savings/send-pin-otp", authenticate, async (req, res) => {
   try {
     const code = crypto.randomInt(100000, 1000000).toString();
@@ -607,7 +610,10 @@ app.post("/api/savings/send-pin-otp", authenticate, async (req, res) => {
       attempts: 0
     });
 
-    if (error) throw error;
+    if (error) {
+      console.error("DB ERROR SAVING OTP:", error);
+      return res.status(500).json({ success: false, message: "Database failed to save OTP." });
+    }
 
     if (SEND_TRANSFER_OTP_EMAIL) {
       try {
@@ -624,7 +630,7 @@ app.post("/api/savings/send-pin-otp", authenticate, async (req, res) => {
             </div>
           `
         });
-      } catch (err) { console.error("PIN OTP EMAIL ERROR:", err); }
+      } catch (err) { console.error("RESEND EMAIL ERROR:", err); }
     }
 
     return res.json({ success: true, message: "OTP sent" });
@@ -656,18 +662,85 @@ app.post("/api/savings/confirm-pin-otp", authenticate, async (req, res) => {
       return res.status(401).json({ success: false, message: "Incorrect OTP code" });
     }
 
-    // OTP is correct. Save the new PIN.
     const pinHash = crypto.createHash("sha256").update(String(pin)).digest("hex");
     const { error } = await supabase.from("profiles").update({ savings_pin_hash: pinHash }).eq("id", req.user.id);
     if (error) throw error;
 
-    // Delete the used OTP record
     await supabase.from("pin_verifications").delete().eq("id", verification.id);
 
     return res.json({ success: true, message: "PIN updated successfully" });
   } catch (error) {
-    console.error("PIN CONFIRM ERROR:", error);
     return res.status(500).json({ success: false, message: "Unable to verify OTP" });
+  }
+});
+
+// 3. Verify PIN (Used when unlocking the Savings modal)
+app.post("/api/savings/verify-pin", authenticate, async (req, res) => {
+  try {
+    const { pin } = req.body || {};
+    if (!pin) return res.status(400).json({ success: false, message: "PIN required" });
+
+    const { data: profile } = await supabase.from("profiles").select("savings_pin_hash").eq("id", req.user.id).maybeSingle();
+    if (!profile || !profile.savings_pin_hash) return res.status(400).json({ success: false, message: "No PIN set" });
+
+    const pinHash = crypto.createHash("sha256").update(String(pin)).digest("hex");
+    if (pinHash !== profile.savings_pin_hash) return res.status(401).json({ success: false, message: "Incorrect PIN" });
+
+    return res.json({ success: true, message: "PIN verified" });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Unable to verify PIN" });
+  }
+});
+
+// 4. Transfer between Savings and Checking
+app.post("/api/savings/transfer", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { amount, direction } = req.body || {}; // "to_savings" or "to_checking"
+    const transferAmount = Number(amount);
+
+    if (!Number.isFinite(transferAmount) || transferAmount <= 0) return res.status(400).json({ success: false, message: "Invalid amount" });
+
+    const { data: accounts } = await supabase.from("accounts").select("*").eq("user_id", userId);
+    const checkingAcc = accounts.find(a => a.account_type === "checking");
+    const savingsAcc = accounts.find(a => a.account_type === "savings");
+
+    if (!checkingAcc || !savingsAcc) return res.status(404).json({ success: false, message: "Account not found" });
+
+    const { data: balances } = await supabase.from("account_balances").select("*").in("account_id", [checkingAcc.id, savingsAcc.id]);
+    const checkingBal = balances.find(b => b.account_id === checkingAcc.id);
+    const savingsBal = balances.find(b => b.account_id === savingsAcc.id);
+
+    const currentChecking = Number(checkingBal?.available_balance || 0);
+    const currentSavings = Number(savingsBal?.available_balance || 0);
+
+    if (direction === "to_savings" && currentChecking < transferAmount) return res.status(400).json({ success: false, message: "Insufficient checking balance" });
+    if (direction === "to_checking" && currentSavings < transferAmount) return res.status(400).json({ success: false, message: "Insufficient savings balance" });
+
+    const newChecking = direction === "to_savings" ? currentChecking - transferAmount : currentChecking + transferAmount;
+    const newSavings = direction === "to_savings" ? currentSavings + transferAmount : currentSavings - transferAmount;
+
+    await supabase.from("account_balances").update({ available_balance: newChecking }).eq("account_id", checkingAcc.id);
+    await supabase.from("account_balances").update({ available_balance: newSavings }).eq("account_id", savingsAcc.id);
+
+    // LOG ONLY ONE TRANSACTION to prevent duplicates in history
+    const isToSavings = direction === "to_savings";
+    await supabase.from("transactions").insert({
+      user_id: userId,
+      account_id: checkingAcc.id,
+      account_number: checkingAcc.account_number,
+      amount: transferAmount,
+      type: isToSavings ? "Transfer to Savings" : "Transfer from Savings",
+      direction: isToSavings ? "out" : "in",
+      description: isToSavings ? "Transfer to Savings Account" : "Transfer from Savings Account",
+      status: "completed",
+      reference: generateReference("TRF")
+    });
+
+    return res.json({ success: true, message: "Transfer successful", newChecking, newSavings });
+  } catch (error) {
+    console.error("SAVINGS TRANSFER ERROR:", error);
+    return res.status(500).json({ success: false, message: "Unable to complete transfer" });
   }
 });
 
