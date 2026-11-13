@@ -117,8 +117,11 @@ const PROFILE_PHOTO_MAX_BYTES = 1.5 * 1024 * 1024;
 function getProfileAvatarUrl(avatarPath) {
   if (!avatarPath) return null;
   try {
-    const { data } = supabase.storage.from(PROFILE_PHOTO_BUCKET).getPublicUrl(avatarPath);
-    return data?.publicUrl || null;
+    const { data } = supabase.storage.from("profile-photos").getPublicUrl(avatarPath);
+    if (!data?.publicUrl) return null;
+    
+    // Append a timestamp so the browser always fetches the latest image
+    return `${data.publicUrl}?t=${Date.now()}`;
   } catch (error) {
     console.error("PROFILE PHOTO PUBLIC URL ERROR:", error);
     return null;
