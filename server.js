@@ -3850,12 +3850,10 @@ async function handleAdminDeposit(req, res) {
       generateReference("DEP");
 
     /* ---------- Insert the transaction record (receipt) ---------- */
-    // depositor_name is stored in BOTH recipient_name (existing column)
-    // and depositor_name (new column) so the user history page can
-    // display it no matter which field it reads.
     const transactionRow = {
       user_id: userId,
       account_id: targetAccount.id,
+      account_number: targetAccount.account_number, // <-- SAVES ACCOUNT NUMBER
       amount: depositAmount,
       type: "Deposit",
       direction: "in",
@@ -3877,6 +3875,32 @@ async function handleAdminDeposit(req, res) {
 
     if (txError) {
       console.error("ADMIN DEPOSIT TX INSERT ERROR:", txError);
+      
+      // Fallback: If 'account_number' doesn't exist in your table yet, it will retry without it
+      if (txError.message.includes("account_number")) {
+          delete transactionRow.account_number;
+          const { data: retryTx, error: retryError } = await supabase
+            .from("transactions")
+            .insert(transactionRow)
+            .select()
+            .single();
+            
+          if (retryError) {
+            return res.status(500).json({ success: false, message: "Unable to save deposit receipt: " + retryError.message });
+          }
+          
+          try {
+            await supabase.from("notifications").insert({
+              user_id: userId,
+              title: "Deposit Received",
+              message: `${formatMoneyServer(depositAmount)} was deposited into your ${type} account by ${depositorName}. Ref: ${reference}`,
+              type: "transaction"
+            });
+          } catch (e) {}
+
+          return res.status(201).json({ success: true, message: "Deposit recorded successfully", reference: reference, transaction: retryTx });
+      }
+      
       return res.status(500).json({
         success: false,
         message:
