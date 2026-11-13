@@ -4325,6 +4325,106 @@ app.patch(
 );
 
 /* =====================================================
+   SAVINGS — TRANSFER BETWEEN ACCOUNTS
+===================================================== */
+app.post("/api/savings/transfer", authenticate, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { amount, direction } = req.body || {}; // direction: "to_savings" or "to_checking"
+    const transferAmount = Number(amount);
+
+    if (!Number.isFinite(transferAmount) || transferAmount <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid amount" });
+    }
+
+    // 1. Get both accounts
+    const { data: accounts, error: accError } = await supabase
+      .from("accounts")
+      .select("*")
+      .eq("user_id", userId);
+
+    if (accError) throw accError;
+
+    const checkingAcc = accounts.find(a => a.account_type === "checking");
+    const savingsAcc = accounts.find(a => a.account_type === "savings");
+
+    if (!checkingAcc || !savingsAcc) {
+      return res.status(404).json({ success: false, message: "Account not found" });
+    }
+
+    // 2. Get balances
+    const { data: balances } = await supabase
+      .from("account_balances")
+      .select("*")
+      .in("account_id", [checkingAcc.id, savingsAcc.id]);
+
+    const checkingBal = balances.find(b => b.account_id === checkingAcc.id);
+    const savingsBal = balances.find(b => b.account_id === savingsAcc.id);
+
+    const currentChecking = Number(checkingBal?.available_balance || 0);
+    const currentSavings = Number(savingsBal?.available_balance || 0);
+
+    if (direction === "to_savings" && currentChecking < transferAmount) {
+      return res.status(400).json({ success: false, message: "Insufficient checking balance" });
+    }
+    if (direction === "to_checking" && currentSavings < transferAmount) {
+      return res.status(400).json({ success: false, message: "Insufficient savings balance" });
+    }
+
+    // 3. Calculate new balances
+    const newChecking = direction === "to_savings" ? currentChecking - transferAmount : currentChecking + transferAmount;
+    const newSavings = direction === "to_savings" ? currentSavings + transferAmount : currentSavings - transferAmount;
+
+    // 4. Update balances
+    await supabase.from("account_balances").update({ available_balance: newChecking }).eq("account_id", checkingAcc.id);
+    await supabase.from("account_balances").update({ available_balance: newSavings }).eq("account_id", savingsAcc.id);
+
+    // 5. Log Transactions
+    const now = new Date().toISOString();
+    const isToSavings = direction === "to_savings";
+    
+    // Log Checking Transaction
+    await supabase.from("transactions").insert({
+      user_id: userId,
+      account_id: checkingAcc.id,
+      account_number: checkingAcc.account_number,
+      amount: transferAmount,
+      type: isToSavings ? "Transfer to Savings" : "Transfer from Savings",
+      direction: isToSavings ? "out" : "in",
+      description: isToSavings ? "Transfer to Savings Account" : "Transfer from Savings Account",
+      status: "completed",
+      reference: generateReference("TRF"),
+      created_at: now
+    });
+
+    // Log Savings Transaction
+    await supabase.from("transactions").insert({
+      user_id: userId,
+      account_id: savingsAcc.id,
+      account_number: savingsAcc.account_number,
+      amount: transferAmount,
+      type: isToSavings ? "Transfer from Checking" : "Transfer to Checking",
+      direction: isToSavings ? "in" : "out",
+      description: isToSavings ? "Transfer from Checking Account" : "Transfer to Checking Account",
+      status: "completed",
+      reference: generateReference("TRF"),
+      created_at: now
+    });
+
+    return res.json({
+      success: true,
+      message: "Transfer successful",
+      newChecking,
+      newSavings
+    });
+
+  } catch (error) {
+    console.error("SAVINGS TRANSFER ERROR:", error);
+    return res.status(500).json({ success: false, message: "Unable to complete transfer" });
+  }
+});
+
+/* =====================================================
    404 HANDLER
 ===================================================== */
 
