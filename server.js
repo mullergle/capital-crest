@@ -38,7 +38,8 @@ app.use(cors({
     allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
-app.use(express.json({ limit: "2mb" }));
+// Raised from 2mb: a 1.5MB image becomes ~2MB once base64-encoded
+app.use(express.json({ limit: "6mb" }));
 
 /* =====================================================
    BASIC
@@ -114,17 +115,35 @@ function generateCardDetails() {
 const PROFILE_PHOTO_BUCKET = "profile-photos";
 const PROFILE_PHOTO_MAX_BYTES = 1.5 * 1024 * 1024;
 
-function getProfileAvatarUrl(avatarPath) {
+// Returns a signed URL (works whether the bucket is private or public).
+// NOTE: this is async — always use `await`.
+async function getProfileAvatarUrl(avatarPath) {
   if (!avatarPath) return null;
   try {
-    const { data } = supabase.storage.from("profile-photos").getPublicUrl(avatarPath);
-    if (!data?.publicUrl) return null;
-    
-    // Append a timestamp so the browser always fetches the latest image
-    return `${data.publicUrl}?t=${Date.now()}`;
+    const { data, error } = await supabase.storage
+      .from(PROFILE_PHOTO_BUCKET)
+      .createSignedUrl(avatarPath, 60 * 60 * 24 * 7); // valid for 7 days
+    if (error || !data?.signedUrl) {
+      console.error("AVATAR SIGNED URL ERROR:", error);
+      return null;
+    }
+    return data.signedUrl;
   } catch (error) {
-    console.error("PROFILE PHOTO PUBLIC URL ERROR:", error);
+    console.error("AVATAR SIGNED URL EXCEPTION:", error);
     return null;
+  }
+}
+
+// Makes sure the storage bucket exists (created private if missing)
+async function ensurePhotoBucket() {
+  try {
+    const { data } = await supabase.storage.getBucket(PROFILE_PHOTO_BUCKET);
+    if (!data) {
+      const { error } = await supabase.storage.createBucket(PROFILE_PHOTO_BUCKET, { public: false });
+      if (error) console.error("CREATE BUCKET ERROR:", error);
+    }
+  } catch (e) {
+    console.error("ENSURE BUCKET ERROR:", e);
   }
 }
 
@@ -324,6 +343,12 @@ app.get(["/admin/users", "/api/admin/users"], authenticateAdmin, async (req, res
 
       const balanceMap = new Map((balances || []).map(b => [b.account_id, b]));
 
+      // Build signed photo URLs for every profile that has a photo
+      const avatarMap = new Map();
+      await Promise.all((profiles || []).filter(p => p.avatar_path).map(async p => {
+        avatarMap.set(p.id, await getProfileAvatarUrl(p.avatar_path));
+      }));
+
       const users = (profiles || []).filter(profile => !isAdminValue(profile.is_admin)).map(profile => {
           const authUser = authMap.get(profile.id);
           const userAccounts = accountsByUser.get(profile.id) || [];
@@ -339,7 +364,7 @@ app.get(["/admin/users", "/api/admin/users"], authenticateAdmin, async (req, res
             surname: profile.surname || "",
             email: authUser?.email || profile.email || "No email",
             phone: profile.phone || "",
-            avatar_url: getProfileAvatarUrl(profile.avatar_path),
+            avatar_url: avatarMap.get(profile.id) || null,
             balance,
             account,
             account_balance: accountBalance,
@@ -512,7 +537,7 @@ app.post("/api/auth/login", async (req, res) => {
       if (profileError) return res.status(500).json({ success: false, message: "Unable to verify account", error: profileError.message });
       if (!profile) return res.status(403).json({ success: false, message: "User profile not found" });
 
-      profile.avatar_url = getProfileAvatarUrl(profile.avatar_path);
+      profile.avatar_url = await getProfileAvatarUrl(profile.avatar_path);
 
       return res.json({
         success: true,
@@ -543,7 +568,7 @@ app.get("/api/auth/me", authenticate, async (req, res) => {
       if (profileError) return res.status(500).json({ success: false, message: "Unable to load profile", error: profileError.message });
       if (!profile) return res.status(404).json({ success: false, message: "Profile not found" });
 
-      profile.avatar_url = getProfileAvatarUrl(profile.avatar_path);
+      profile.avatar_url = await getProfileAvatarUrl(profile.avatar_path);
 
       let address = null;
       try {
@@ -1178,7 +1203,7 @@ app.get("/api/admin/users/:id", authenticateAdmin, async (req, res) => {
         success: true,
         profile: {
           ...profile,
-          avatar_url: getProfileAvatarUrl(profile.avatar_path),
+          avatar_url: await getProfileAvatarUrl(profile.avatar_path),
           full_name: fullName || "Unnamed User",
           email: authUser?.email || profile.email || "No email"
         },
@@ -1257,8 +1282,9 @@ app.put("/api/admin/users/:id/balances", authenticateAdmin, async (req, res) => 
 });
 
 /* =====================================================
-   ADMIN — UPDATE USER PROFILE PHOTO
+   ADMIN — UPDATE USER PROFILE PHOTO (ADMIN ONLY)
 ===================================================== */
+
 app.post("/api/admin/users/:id/photo", authenticateAdmin, async (req, res) => {
   try {
     const userId = req.params.id;
@@ -1268,10 +1294,14 @@ app.post("/api/admin/users/:id/photo", authenticateAdmin, async (req, res) => {
       return res.status(400).json({ success: false, message: "Profile photo is required" });
     }
 
-    const match = image.match(/^data:(image\/jpeg|image\/jpg|image\/png|image\/webp);base64,(.+)$/);
+    const match = image.match(/^data:(image\/jpeg|image\/jpg|image\/png|image\/webp);base64,([A-Za-z0-9+/=]+)$/);
     if (!match) {
       return res.status(400).json({ success: false, message: "Invalid profile photo format" });
     }
+
+    const extMap = { "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png", "image/webp": "webp" };
+    const ext = extMap[match[1]];
+    const contentType = match[1] === "image/jpg" ? "image/jpeg" : match[1];
 
     const imageBuffer = Buffer.from(match[2], "base64");
     if (!imageBuffer.length) {
@@ -1281,46 +1311,60 @@ app.post("/api/admin/users/:id/photo", authenticateAdmin, async (req, res) => {
       return res.status(400).json({ success: false, message: "Profile photo must be smaller than 1.5MB" });
     }
 
-    // Upload to Supabase Storage (reusing the existing bucket)
-    const avatarPath = `${userId}/avatar.jpg`;
+    const { data: target, error: targetError } = await supabase
+      .from("profiles")
+      .select("id, is_admin, avatar_path")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (targetError || !target) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+    if (isAdminValue(target.is_admin)) {
+      return res.status(403).json({ success: false, message: "Photos can only be set for customers here" });
+    }
+
+    // Unique file name per upload so old copies are never served from cache
+    const avatarPath = `${userId}/avatar-${Date.now()}.${ext}`;
     const { error: uploadError } = await supabase.storage
       .from(PROFILE_PHOTO_BUCKET)
       .upload(avatarPath, imageBuffer, {
-        contentType: "image/jpeg",
-        cacheControl: "3600",
-        upsert: true
+        contentType,
+        cacheControl: "31536000",
+        upsert: false
       });
 
     if (uploadError) {
       console.error("ADMIN PHOTO UPLOAD ERROR:", uploadError);
-      return res.status(500).json({ success: false, message: "Unable to upload photo" });
+      return res.status(500).json({ success: false, message: "Unable to upload photo: " + uploadError.message });
     }
 
-    const avatarUrl = getProfileAvatarUrl(avatarPath);
-
-    // Save to the user's profile
     const { error: profileUpdateError } = await supabase
       .from("profiles")
-      .update({ avatar_path: avatarPath, avatar_url: avatarUrl })
+      .update({ avatar_path: avatarPath })
       .eq("id", userId);
 
     if (profileUpdateError) {
       console.error("ADMIN PHOTO PROFILE UPDATE ERROR:", profileUpdateError);
-      return res.status(500).json({ success: false, message: "Photo uploaded but profile could not be updated" });
+      await supabase.storage.from(PROFILE_PHOTO_BUCKET).remove([avatarPath]);
+      return res.status(500).json({ success: false, message: "Could not save photo: " + profileUpdateError.message });
+    }
+
+    // Remove the previous photo file
+    if (target.avatar_path && target.avatar_path !== avatarPath) {
+      try { await supabase.storage.from(PROFILE_PHOTO_BUCKET).remove([target.avatar_path]); } catch (e) { console.error(e); }
     }
 
     return res.json({
       success: true,
       message: "Profile photo updated successfully",
-      avatar_url: avatarUrl
+      avatar_url: await getProfileAvatarUrl(avatarPath)
     });
   } catch (error) {
     console.error("ADMIN PHOTO EXCEPTION:", error);
     return res.status(500).json({ success: false, message: "Unable to update profile photo" });
   }
 });
-
-
 
 /* =====================================================
    ADMIN — DEPOSIT FUNDS
@@ -1408,48 +1452,16 @@ app.post("/api/admin/users/:id/deposits", authenticateAdmin, handleAdminDeposit)
 app.post("/api/admin/users/:id/transactions", authenticateAdmin, handleAdminDeposit);
 
 /* =====================================================
-   PROFILE PHOTO UPLOAD
+   PROFILE PHOTO — CUSTOMERS CANNOT CHANGE IT
+   (only administrators can, via /api/admin/users/:id/photo)
 ===================================================== */
 
-app.post("/api/profile/photo", authenticate, async (req, res) => {
-    try {
-      const { image } = req.body || {};
-      if (!image || typeof image !== "string") return res.status(400).json({ success: false, message: "Profile photo is required" });
-
-      const match = image.match(/^data:(image\/jpeg|image\/jpg|image\/png|image\/webp);base64,(.+)$/);
-      if (!match) return res.status(400).json({ success: false, message: "Invalid profile photo format" });
-
-      const imageBuffer = Buffer.from(match[2], "base64");
-      if (!imageBuffer.length) return res.status(400).json({ success: false, message: "Profile photo is empty" });
-      if (imageBuffer.length > PROFILE_PHOTO_MAX_BYTES) return res.status(400).json({ success: false, message: "Profile photo must be smaller than 1.5MB" });
-
-      const avatarPath = `${req.user.id}/avatar.jpg`;
-      const { error: uploadError } = await supabase.storage.from(PROFILE_PHOTO_BUCKET).upload(avatarPath, imageBuffer, { contentType: "image/jpeg", cacheControl: "3600", upsert: true });
-      if (uploadError) return res.status(500).json({ success: false, message: "Unable to upload profile photo" });
-
-      const avatarUrl = getProfileAvatarUrl(avatarPath);
-      const { error: profileUpdateError } = await supabase.from("profiles").update({ avatar_path: avatarPath, avatar_url: avatarUrl }).eq("id", req.user.id);
-      if (profileUpdateError) return res.status(500).json({ success: false, message: "Photo uploaded but profile could not be updated" });
-
-      return res.status(200).json({ success: true, message: "Profile photo updated successfully", avatar_url: avatarUrl, avatar_path: avatarPath });
-    } catch (error) {
-      return res.status(500).json({ success: false, message: "Unable to update profile photo" });
-    }
+app.post("/api/profile/photo", authenticate, (req, res) => {
+  res.status(403).json({ success: false, message: "Only an administrator can change profile photos" });
 });
 
-app.delete("/api/profile/photo", authenticate, async (req, res) => {
-    try {
-      const { data: profile } = await supabase.from("profiles").select("avatar_path").eq("id", req.user.id).maybeSingle();
-      if (profile?.avatar_path) {
-        const { error: storageError } = await supabase.storage.from(PROFILE_PHOTO_BUCKET).remove([profile.avatar_path]);
-        if (storageError) return res.status(500).json({ success: false, message: "Unable to remove profile photo" });
-      }
-
-      await supabase.from("profiles").update({ avatar_path: null, avatar_url: null }).eq("id", req.user.id);
-      return res.json({ success: true, message: "Profile photo removed successfully" });
-    } catch (error) {
-      return res.status(500).json({ success: false, message: "Unable to remove profile photo" });
-    }
+app.delete("/api/profile/photo", authenticate, (req, res) => {
+  res.status(403).json({ success: false, message: "Only an administrator can change profile photos" });
 });
 
 /* =====================================================
@@ -1522,9 +1534,13 @@ app.use((req, res) => {
 app.use((error, req, res, next) => {
   console.error("UNHANDLED SERVER ERROR:", error);
   if (res.headersSent) return next(error);
+  if (error.type === "entity.too.large") {
+    return res.status(413).json({ success: false, message: "Image is too large" });
+  }
   res.status(500).json({ success: false, message: "Internal server error", error: error.message });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
+  await ensurePhotoBucket();
   console.log(`Crest United Bank API running on port ${PORT}`);
 });
