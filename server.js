@@ -624,6 +624,24 @@ app.get("/api/auth/me", authenticate, async (req, res) => {
    SAVINGS — PIN SETUP, OTP & TRANSFERS
 ===================================================== */
 
+// 0. SET PIN DIRECTLY (This is the NEW route that fixes your error!)
+app.post("/api/savings/set-pin", authenticate, async (req, res) => {
+  try {
+    const { pin } = req.body || {};
+    if (!pin || String(pin).length !== 4) return res.status(400).json({ success: false, message: "PIN must be 4 digits" });
+
+    const pinHash = crypto.createHash("sha256").update(String(pin)).digest("hex");
+    const { error } = await supabase.from("profiles").update({ savings_pin_hash: pinHash }).eq("id", req.user.id);
+    
+    if (error) throw error;
+
+    return res.json({ success: true, message: "PIN set successfully" });
+  } catch (error) {
+    console.error("SET PIN ERROR:", error);
+    return res.status(500).json({ success: false, message: "Unable to set PIN" });
+  }
+});
+
 // 1. Send OTP for PIN change
 app.post("/api/savings/send-pin-otp", authenticate, async (req, res) => {
   try {
