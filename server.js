@@ -934,7 +934,7 @@ app.post("/api/transfers", authenticate, async (req, res) => {
 
       const { data: account, error: accountError } = await supabase.from("accounts").select("*").eq("user_id", req.user.id).eq("account_type", "checking").in("status", ["active", "suspended"]).limit(1).maybeSingle();
       if (accountError || !account) return res.status(404).json({ success: false, message: "Active checking account not found" });
-      if (account.status === "suspended") return res.status(403).json({ success: false, message: "Your account is currently suspended." });
+      if (account.status === "suspended") return res.status(403).json({ success: false, message: "Transfer failed, pls contact support service." });
 
       const { data: balance, error: balanceError } = await supabase.from("account_balances").select("*").eq("account_id", account.id).maybeSingle();
       if (balanceError || !balance) return res.status(404).json({ success: false, message: "Account balance not found" });
