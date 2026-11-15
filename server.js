@@ -440,7 +440,7 @@ app.post("/api/auth/register", async (req, res) => {
     let createdAccountId = null;
 
     try {
-      const { fname, sname, email, ssn, phone, pass, cpass, country, state, city, address, terms } = req.body || {};
+      const { fname, sname, email, ssn, phone, pass, cpass, country, state, city, address, terms, currency } = req.body || {};
       const cleanEmail = String(email || "").trim().toLowerCase();
       const cleanFirstName = String(fname || "").trim();
       const cleanSurname = String(sname || "").trim();
@@ -449,6 +449,7 @@ app.post("/api/auth/register", async (req, res) => {
       const cleanState = String(state || "").trim();
       const cleanCity = String(city || "").trim();
       const cleanAddress = String(address || "").trim();
+      const cleanCurrency = String(currency || "USD").trim().toUpperCase();
 
       if (!cleanFirstName || !cleanSurname || !cleanEmail || !cleanPhone || !pass || !cpass || !cleanCountry || !cleanState || !cleanCity || !cleanAddress) {
         return res.status(400).json({ success: false, message: "All required fields must be provided" });
@@ -461,7 +462,17 @@ app.post("/api/auth/register", async (req, res) => {
       if (authError || !authData?.user) return res.status(400).json({ success: false, message: authError?.message || "Unable to create account" });
       createdUserId = authData.user.id;
 
-      const { error: profileError } = await supabase.from("profiles").insert({ id: createdUserId, first_name: cleanFirstName, surname: cleanSurname, phone: cleanPhone, ssn: ssn ? String(ssn).trim() : null, is_admin: false });
+      // UPDATED: Save currency to profile
+      const { error: profileError } = await supabase.from("profiles").insert({ 
+        id: createdUserId, 
+        first_name: cleanFirstName, 
+        surname: cleanSurname, 
+        phone: cleanPhone, 
+        ssn: ssn ? String(ssn).trim() : null, 
+        is_admin: false,
+        currency: cleanCurrency
+      });
+      
       if (profileError) {
         await cleanupRegistration(createdUserId);
         return res.status(500).json({ success: false, message: "Unable to create customer profile", error: profileError.message });
@@ -474,7 +485,7 @@ app.post("/api/auth/register", async (req, res) => {
       }
 
       const accountNumber = await generateAccountNumber();
-      const { data: account, error: accountError } = await supabase.from("accounts").insert({ user_id: createdUserId, account_number: accountNumber, account_type: "checking", currency: "USD", status: "active" }).select().single();
+      const { data: account, error: accountError } = await supabase.from("accounts").insert({ user_id: createdUserId, account_number: accountNumber, account_type: "checking", currency: cleanCurrency, status: "active" }).select().single();
       if (accountError || !account) {
         await cleanupRegistration(createdUserId);
         return res.status(500).json({ success: false, message: "Unable to create bank account", error: accountError?.message });
@@ -533,7 +544,12 @@ app.post("/api/auth/login", async (req, res) => {
 
       if (error || !data?.user || !data?.session) return res.status(401).json({ success: false, message: "Invalid email or password" });
 
-      const { data: profile, error: profileError } = await supabase.from("profiles").select("id, first_name, surname, phone, is_admin, avatar_path, savings_pin_hash").eq("id", data.user.id).maybeSingle();
+      // UPDATED: Select currency
+      const { data: profile, error: profileError } = await supabase.from("profiles")
+        .select("id, first_name, surname, phone, is_admin, avatar_path, savings_pin_hash, currency")
+        .eq("id", data.user.id)
+        .maybeSingle();
+        
       if (profileError) return res.status(500).json({ success: false, message: "Unable to verify account", error: profileError.message });
       if (!profile) return res.status(403).json({ success: false, message: "User profile not found" });
 
