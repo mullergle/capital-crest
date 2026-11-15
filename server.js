@@ -1091,6 +1091,118 @@ app.post("/api/transfers/verify", authenticate, async (req, res) => {
     }
 });
 
+
+/* =====================================================
+   CARDS - ISSUE NEW CARD (Custom Request)
+===================================================== */
+app.post("/api/cards/issue", authenticate, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { card_type, card_name, fee, initial_deposit } = req.body || {};
+        
+        const depositAmount = Number(initial_deposit);
+        const cardFee = Number(fee);
+
+        if (!Number.isFinite(depositAmount) || depositAmount <= 0) {
+            return res.status(400).json({ success: false, message: "Invalid initial deposit amount" });
+        }
+
+        // 1. Verify user has a checking account and enough balance
+        const { data: account, error: accountError } = await supabase
+            .from("accounts")
+            .select("*")
+            .eq("user_id", userId)
+            .eq("account_type", "checking")
+            .maybeSingle();
+
+        if (accountError || !account) {
+            return res.status(404).json({ success: false, message: "Checking account not found" });
+        }
+
+        const { data: balance, error: balanceError } = await supabase
+            .from("account_balances")
+            .select("*")
+            .eq("account_id", account.id)
+            .maybeSingle();
+
+        if (balanceError || !balance) {
+            return res.status(404).json({ success: false, message: "Account balance not found" });
+        }
+
+        const currentBalance = Number(balance.available_balance);
+        const totalDeduction = depositAmount + cardFee;
+
+        if (currentBalance < totalDeduction) {
+            return res.status(400).json({ success: false, message: `Insufficient funds. You need $${totalDeduction.toFixed(2)} (Deposit + Fee) to issue this card.` });
+        }
+
+        // 2. Generate the new card details (using the helper function from your backend)
+        const cardDetails = generateCardDetails();
+
+        // 3. Insert the new card into the database
+        const { data: newCard, error: cardError } = await supabase.from("cards").insert({
+            user_id: userId,
+            account_id: account.id,
+            card_number: cardDetails.card_number,
+            last_four: cardDetails.last_four,
+            expiry_month: cardDetails.expiry_month,
+            expiry_year: cardDetails.expiry_year,
+            cvv: cardDetails.cvv,
+            card_type: card_type || "debit",
+            brand: "Visa", // Or Mastercard based on your logic
+            status: "active",
+            balance: depositAmount // Load the initial deposit onto the card
+        }).select().single();
+
+        if (cardError) {
+            console.error("CARD ISSUE ERROR:", cardError);
+            return res.status(500).json({ success: false, message: "Failed to create card record" });
+        }
+
+        // 4. Deduct the money from the checking account (Deposit + Fee)
+        await supabase.from("account_balances").update({ 
+            available_balance: currentBalance - totalDeduction,
+            updated_at: new Date().toISOString()
+        }).eq("account_id", account.id);
+
+        // 5. Log the transaction
+        await supabase.from("transactions").insert({
+            user_id: userId,
+            account_id: account.id,
+            account_number: account.account_number,
+            amount: totalDeduction,
+            type: "Card Issuance",
+            direction: "out",
+            description: `Issuance of ${card_name || "New Card"} (Deposit: $${depositAmount.toFixed(2)}, Fee: $${cardFee.toFixed(2)})`,
+            status: "completed",
+            reference: generateReference("CRD")
+        });
+
+        // 6. Send a notification
+        try {
+            await supabase.from("notifications").insert({
+                user_id: userId,
+                title: "New Card Issued",
+                message: `Your ${card_name || "new card"} has been successfully issued and will arrive in 15 business days. $${depositAmount.toFixed(2)} has been loaded onto it.`,
+                type: "transaction"
+            });
+        } catch (notifError) {
+            console.error("Notification error:", notifError);
+        }
+
+        // Return success
+        return res.status(201).json({
+            success: true,
+            message: "Card issued successfully",
+            card: newCard
+        });
+
+    } catch (error) {
+        console.error("CARD ISSUE EXCEPTION:", error);
+        return res.status(500).json({ success: false, message: "Unable to issue card. Internal server error." });
+    }
+});
+
 /* =====================================================
    CARDS
 ===================================================== */
